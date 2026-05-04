@@ -76,7 +76,29 @@ select {
 }
 
 body.dev-tools .controls {
-  grid-template-columns: 1fr 0.75fr auto auto;
+  grid-template-columns: auto 1fr 0.75fr auto auto;
+}
+
+.view-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: white;
+}
+
+.view-toggle button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 0;
+  color: var(--muted);
+  background: white;
+}
+
+.view-toggle button[aria-pressed="true"] {
+  color: white;
+  background: var(--accent);
 }
 
 label {
@@ -154,6 +176,90 @@ button:disabled {
   grid-template-columns: minmax(0, 1fr) 340px;
 }
 
+.table-workspace {
+  min-height: 0;
+  padding: 18px 20px;
+}
+
+.table-shell {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.table-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
+  gap: 12px;
+  align-items: end;
+  padding: 14px;
+  border-bottom: 1px solid var(--line);
+  background: #fbfbf8;
+}
+
+.table-header h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.table-header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.table-wrap {
+  max-height: calc(100vh - 190px);
+  overflow: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th,
+td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
+}
+
+th:first-child,
+td:first-child {
+  text-align: left;
+  white-space: normal;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: white;
+}
+
+th button,
+td button {
+  min-height: 0;
+  padding: 0;
+  border: 0;
+  color: var(--accent);
+  background: transparent;
+  text-align: inherit;
+}
+
+th button {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+tbody tr:hover {
+  background: #fafaf7;
+}
+
 #graph-canvas {
   width: 100%;
   height: calc(100vh - 93px);
@@ -208,6 +314,96 @@ button:disabled {
   display: block;
   margin-top: 4px;
   font-size: 22px;
+}
+
+.activity-list {
+  display: grid;
+  gap: 7px;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  background: #fbfbf8;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.activity-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border-left: 4px solid var(--line);
+  border-radius: 4px;
+  background: white;
+}
+
+.activity-item strong,
+.activity-item span,
+.activity-item em {
+  display: block;
+  min-width: 0;
+}
+
+.activity-item strong {
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-item span,
+.activity-item em {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.activity-item em {
+  font-style: normal;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.prompt-debug {
+  margin-top: 7px;
+}
+
+.prompt-debug summary {
+  width: fit-content;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prompt-debug pre {
+  max-height: 260px;
+  overflow: auto;
+  margin: 7px 0 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fbfbf8;
+  color: var(--ink);
+  font: 11px/1.35 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  white-space: pre-wrap;
+}
+
+.activity-item.queued {
+  border-left-color: var(--node);
+}
+
+.activity-item.running {
+  border-left-color: var(--accent-2);
+}
+
+.activity-item.done {
+  border-left-color: var(--node-expanded);
+}
+
+.activity-item.failed {
+  border-left-color: #8f2f28;
 }
 
 h2 {
@@ -269,6 +465,25 @@ h2 {
 .dedupe-group span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.dedupe-actions {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.dedupe-actions button {
+  margin-top: 0;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.dedupe-actions button[data-dedupe-action="reject"] {
+  color: var(--accent);
+  background: white;
+  border-color: var(--accent);
 }
 
 .guide {
@@ -333,6 +548,16 @@ h2 {
   border-bottom: 5px solid transparent;
 }
 
+.line-swatch.faint::before {
+  height: 0;
+  border-top: 2px dashed rgba(102, 112, 109, 0.45);
+  background: transparent;
+}
+
+.line-swatch.faint::after {
+  border-left-color: rgba(102, 112, 109, 0.45);
+}
+
 .size-swatch {
   position: relative;
   width: 32px;
@@ -376,7 +601,15 @@ h2 {
     grid-template-columns: 1fr 1fr;
   }
 
+  body.dev-tools .controls {
+    grid-template-columns: 1fr 1fr;
+  }
+
   .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .table-header {
     grid-template-columns: 1fr;
   }
 

@@ -18,10 +18,14 @@
           <button id="focus-entity" type="button">Search</button>
         </form>
         <div class="controls" id="main-controls">
+          <div class="view-toggle" aria-label="View">
+            <button id="graph-view" type="button" aria-pressed="true">Graph</button>
+            <button id="table-view" type="button" aria-pressed="false">Table</button>
+          </div>
           <label>
             <span>Min confidence</span>
-            <input id="min-confidence" type="range" min="0" max="1" step="0.01" value="0.35">
-            <strong id="min-confidence-value">0.35</strong>
+            <input id="min-confidence" type="range" min="0" max="1" step="0.01" value="0">
+            <strong id="min-confidence-value">0.00</strong>
           </label>
           <label class="dev-only">
             <span>Auto budget</span>
@@ -43,6 +47,10 @@
             <div><span>Expanded</span><strong id="expanded-count">0</strong></div>
           </div>
           <section>
+            <h2>Activity</h2>
+            <div id="activity-list" class="activity-list">Nothing running.</div>
+          </section>
+          <section>
             <h2>Guide</h2>
             <div class="guide">
               <div class="guide-row">
@@ -58,6 +66,10 @@
                 <span>Arrows point from influencer to influenced.</span>
               </div>
               <div class="guide-row">
+                <span class="line-swatch faint"></span>
+                <span>Faint dashed arrows are low-confidence links or links below the current filter.</span>
+              </div>
+              <div class="guide-row">
                 <span class="size-swatch">
                   <i></i><b></b>
                 </span>
@@ -69,6 +81,9 @@
               <div class="guide-note">
                 Drag to pan, scroll to zoom, click nodes or arrows for details. Expanded entities can be sampled again to add fresh observations without deleting existing ones.
               </div>
+              <div class="guide-note">
+                Ambiguous names are expanded with nearby graph context so a name discovered from a band, film, or game keeps that intended meaning.
+              </div>
             </div>
           </section>
           <section>
@@ -79,10 +94,37 @@
             <h2>Dedupe Review</h2>
             <div class="details">
               <button id="dedupe-review" type="button">Review possible duplicates</button>
-              <div id="dedupe-output" class="dedupe-output">Local candidates are reviewed by DeepSeek before you merge anything.</div>
+              <div id="dedupe-output" class="dedupe-output">DeepSeek suggestions wait here until a dev approves or rejects each merge.</div>
             </div>
           </section>
         </aside>
+      </section>
+      <section class="table-workspace" id="table-workspace" hidden>
+        <div class="table-shell">
+          <div class="table-header">
+            <div>
+              <h2>Entities</h2>
+              <p>Sort the graph by connection count, observations, popularity, or expansion state.</p>
+            </div>
+            <input id="table-filter" autocomplete="off" placeholder="Filter entities...">
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th><button type="button" data-sort="name">Entity</button></th>
+                  <th><button type="button" data-sort="connections">Connections</button></th>
+                  <th><button type="button" data-sort="incoming">Incoming</button></th>
+                  <th><button type="button" data-sort="outgoing">Outgoing</button></th>
+                  <th><button type="button" data-sort="observations">Observations</button></th>
+                  <th><button type="button" data-sort="popularity">Popularity</button></th>
+                  <th><button type="button" data-sort="expanded">State</button></th>
+                </tr>
+              </thead>
+              <tbody id="entity-table-body"></tbody>
+            </table>
+          </div>
+        </div>
       </section>
     </main>
     <script src="/app.js"></script>
