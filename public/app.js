@@ -7,19 +7,22 @@ const state = {
   edges: new Map(),
   expanded: new Set(),
   selected: null,
+  devTools: false,
   dragging: null,
   pan: { x: 0, y: 0 },
+  zoom: 1,
   lastPointer: null,
   minConfidence: 0.35,
   loaded: false,
   saveTimer: null,
-  saveVersion: 0
+  saveVersion: 0,
+  maxWeightedPopularity: 0
 };
 
 const els = {
   form: document.querySelector("#expand-form"),
   input: document.querySelector("#entity-input"),
-  provider: document.querySelector("#provider-select"),
+  focusEntity: document.querySelector("#focus-entity"),
   minConfidence: document.querySelector("#min-confidence"),
   minConfidenceValue: document.querySelector("#min-confidence-value"),
   autoBudget: document.querySelector("#auto-budget"),
@@ -30,19 +33,25 @@ const els = {
   edgeCount: document.querySelector("#edge-count"),
   observationCount: document.querySelector("#observation-count"),
   expandedCount: document.querySelector("#expanded-count"),
-  selectedDetails: document.querySelector("#selected-details"),
-  frontierList: document.querySelector("#frontier-list"),
-  tokensPerCall: document.querySelector("#tokens-per-call"),
-  pricePerMillion: document.querySelector("#price-per-million"),
-  costOutput: document.querySelector("#cost-output")
+  selectedDetails: document.querySelector("#selected-details")
 };
-
-function keyFor(name) {
-  return String(name || "").trim().replace(/\s+/g, " ").toLowerCase();
-}
 
 function displayName(name) {
   return String(name || "").trim().replace(/\s+/g, " ");
+}
+
+function canonicalName(name) {
+  return displayName(name)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[()[\]{}'"`.,:;!?]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^the\s+/, "")
+    .trim();
+}
+
+function keyFor(name) {
+  return canonicalName(name);
 }
 
 function edgeKey(from, to) {
@@ -51,18 +60,25 @@ function edgeKey(from, to) {
 
 function ensureNode(name) {
   const id = keyFor(name);
+  const label = displayName(name);
   if (!id) return null;
   if (!state.nodes.has(id)) {
     const angle = Math.random() * Math.PI * 2;
     const radius = 80 + Math.random() * 180;
+    const rect = canvas.getBoundingClientRect();
     state.nodes.set(id, {
       id,
-      name: displayName(name),
-      x: canvas.width / 2 + Math.cos(angle) * radius,
-      y: canvas.height / 2 + Math.sin(angle) * radius,
+      name: label,
+      aliases: [],
+      popularity: 0,
+      weightedPopularity: 0,
+      x: rect.width / 2 + Math.cos(angle) * radius,
+      y: rect.height / 2 + Math.sin(angle) * radius,
       vx: 0,
       vy: 0
     });
+  } else if (label && label !== state.nodes.get(id).name && !state.nodes.get(id).aliases.includes(label)) {
+    state.nodes.get(id).aliases.push(label);
   }
   return state.nodes.get(id);
 }
@@ -81,6 +97,27 @@ function addObservation(from, to, confidence) {
 
 function recomputeEdges() {
   const grouped = new Map();
+  state.maxWeightedPopularity = 0;
+  for (const node of state.nodes.values()) {
+    node.popularity = 0;
+    node.weightedPopularity = 0;
+  }
+
+  for (const obs of state.observations) {
+    const source = ensureNode(obs.from);
+    const target = ensureNode(obs.to);
+    if (!source || !target) continue;
+    source.popularity += 1;
+    target.popularity += 1;
+    source.weightedPopularity += obs.confidence;
+    target.weightedPopularity += obs.confidence;
+    state.maxWeightedPopularity = Math.max(
+      state.maxWeightedPopularity,
+      source.weightedPopularity,
+      target.weightedPopularity
+    );
+  }
+
   for (const obs of state.observations) {
     if (obs.confidence < state.minConfidence) continue;
     const key = edgeKey(obs.from, obs.to);
@@ -107,6 +144,54 @@ function recomputeEdges() {
   );
 }
 
+function nodeRadius(node) {
+  const baseRadius = 14;
+  const visualRange = 28;
+  const maxPopularity = Math.max(1, state.maxWeightedPopularity || 0);
+  const share = Math.max(0, node.weightedPopularity || 0) / maxPopularity;
+  return baseRadius + Math.sqrt(share) * visualRange;
+}
+
+function popularityPercent(node) {
+  const maxPopularity = Math.max(1, state.maxWeightedPopularity || 0);
+  return Math.round((Math.max(0, node.weightedPopularity || 0) / maxPopularity) * 100);
+}
+
+function focusNode(node, targetZoom) {
+  if (!node) return false;
+  const rect = canvas.getBoundingClientRect();
+  const nextZoom = Math.max(state.zoom, targetZoom || 1);
+  state.zoom = Math.min(3, Math.max(0.25, nextZoom));
+  state.pan = {
+    x: rect.width / 2 - node.x * state.zoom,
+    y: rect.height / 2 - node.y * state.zoom
+  };
+  state.selected = { type: "node", id: node.id };
+  node.vx = 0;
+  node.vy = 0;
+  setStatus(`Focused ${node.name}.`);
+  scheduleSave();
+  updateUi();
+  return true;
+}
+
+function findNodeByQuery(query) {
+  const needle = canonicalName(query);
+  if (!needle) return null;
+  if (state.nodes.has(needle)) return state.nodes.get(needle);
+
+  const candidates = [...state.nodes.values()].filter(node => {
+    const names = [node.name, ...(node.aliases || [])].map(canonicalName);
+    return names.some(name => name.includes(needle) || needle.includes(name));
+  });
+
+  return candidates.sort((a, b) => {
+    const scoreA = Math.abs(canonicalName(a.name).length - needle.length);
+    const scoreB = Math.abs(canonicalName(b.name).length - needle.length);
+    return scoreA - scoreB || b.weightedPopularity - a.weightedPopularity;
+  })[0] || null;
+}
+
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
   const scale = window.devicePixelRatio || 1;
@@ -123,18 +208,21 @@ function serializeGraph() {
   return {
     nodes: [...state.nodes.values()].map(node => ({
       name: node.name,
+      aliases: node.aliases || [],
       x: node.x,
       y: node.y
     })),
     observations: state.observations.map(observation => ({ ...observation })),
     expanded: [...state.expanded],
     pan: { ...state.pan },
+    zoom: state.zoom,
     minConfidence: state.minConfidence
   };
 }
 
 function hydrateGraph(graph) {
   const minConfidence = Number(graph && graph.minConfidence);
+  const zoom = Number(graph && graph.zoom);
   state.nodes.clear();
   state.observations = [];
   state.edges.clear();
@@ -144,12 +232,14 @@ function hydrateGraph(graph) {
     x: Number(graph && graph.pan && graph.pan.x) || 0,
     y: Number(graph && graph.pan && graph.pan.y) || 0
   };
+  state.zoom = Number.isFinite(zoom) ? Math.max(0.25, Math.min(3, zoom)) : 1;
   state.minConfidence = Number.isFinite(minConfidence) ? Math.max(0, Math.min(1, minConfidence)) : 0.35;
   els.minConfidence.value = state.minConfidence;
 
   for (const node of Array.isArray(graph && graph.nodes) ? graph.nodes : []) {
     const hydrated = ensureNode(node.name);
     if (!hydrated) continue;
+    hydrated.aliases = Array.isArray(node.aliases) ? node.aliases.map(displayName).filter(Boolean) : hydrated.aliases;
     const x = Number(node.x);
     const y = Number(node.y);
     hydrated.x = Number.isFinite(x) ? x : hydrated.x;
@@ -195,6 +285,18 @@ async function loadGraph() {
   updateUi();
 }
 
+async function loadConfig() {
+  try {
+    const response = await fetch("/api/config");
+    const config = await response.json();
+    state.devTools = Boolean(config.devTools);
+    document.body.classList.toggle("dev-tools", state.devTools);
+  } catch (error) {
+    state.devTools = false;
+    document.body.classList.remove("dev-tools");
+  }
+}
+
 async function saveGraph() {
   if (!state.loaded) return;
   const version = ++state.saveVersion;
@@ -219,11 +321,10 @@ function scheduleSave() {
 }
 
 async function fetchInfluences(entity) {
-  const provider = els.provider.value === "mock" ? "mock" : "deepseek";
   const response = await fetch("/api/influences", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ entity, provider })
+    body: JSON.stringify({ entity, provider: "deepseek" })
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Request failed");
@@ -247,7 +348,26 @@ async function expandEntity(entity) {
   state.expanded.add(keyFor(data.entity));
   setStatus(`Expanded ${data.entity} using ${payload.provider}/${payload.model}.`);
   scheduleSave();
+  window.setTimeout(scheduleSave, 2500);
   updateUi();
+}
+
+async function searchEntity(entity) {
+  const query = displayName(entity);
+  if (!query) return;
+  const existing = findNodeByQuery(query);
+  if (existing) {
+    focusNode(existing, 1.15);
+    if (!state.expanded.has(existing.id)) {
+      await expandEntity(existing.name);
+      focusNode(existing, 1.15);
+    }
+    return;
+  }
+  setStatus(`No existing node found for "${query}". Expanding it now...`);
+  await expandEntity(query);
+  const created = findNodeByQuery(query);
+  if (created) focusNode(created, 1.15);
 }
 
 function getFrontier() {
@@ -320,17 +440,17 @@ function simulatePhysics() {
   }
 }
 
-function drawArrow(from, to, confidence, selected) {
+function drawArrow(from, to, confidence, count, selected) {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
   const ux = dx / dist;
   const uy = dy / dist;
-  const startX = from.x + ux * 20;
-  const startY = from.y + uy * 20;
-  const endX = to.x - ux * 22;
-  const endY = to.y - uy * 22;
-  const width = 1 + confidence * 3;
+  const startX = from.x + ux * (nodeRadius(from) + 3);
+  const startY = from.y + uy * (nodeRadius(from) + 3);
+  const endX = to.x - ux * (nodeRadius(to) + 5);
+  const endY = to.y - uy * (nodeRadius(to) + 5);
+  const width = 1 + confidence * 3 + Math.min(2, Math.log2(Math.max(1, count)) * 0.7);
 
   ctx.strokeStyle = selected ? "#b4472f" : `rgba(31, 35, 38, ${0.2 + confidence * 0.48})`;
   ctx.lineWidth = width;
@@ -356,19 +476,21 @@ function draw() {
   ctx.clearRect(0, 0, width, height);
   ctx.save();
   ctx.translate(state.pan.x, state.pan.y);
+  ctx.scale(state.zoom, state.zoom);
 
   for (const [key, edge] of state.edges) {
-    drawArrow(edge.from, edge.to, edge.confidence, state.selected && state.selected.type === "edge" && state.selected.key === key);
+    drawArrow(edge.from, edge.to, edge.confidence, edge.count, state.selected && state.selected.type === "edge" && state.selected.key === key);
   }
 
   for (const node of state.nodes.values()) {
     const expanded = state.expanded.has(node.id);
     const selected = state.selected && state.selected.type === "node" && state.selected.id === node.id;
+    const radius = nodeRadius(node);
     ctx.fillStyle = expanded ? "#35a186" : "#f0b84d";
     ctx.strokeStyle = selected ? "#b4472f" : "#1f2326";
     ctx.lineWidth = selected ? 4 : 1.5;
     ctx.beginPath();
-    ctx.arc(node.x, node.y, selected ? 20 : 17, 0, Math.PI * 2);
+    ctx.arc(node.x, node.y, selected ? radius + 3 : radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 
@@ -377,7 +499,7 @@ function draw() {
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
     const label = node.name.length > 28 ? `${node.name.slice(0, 25)}...` : node.name;
-    ctx.fillText(label, node.x, node.y + 23);
+    ctx.fillText(label, node.x, node.y + radius + 7);
   }
 
   ctx.restore();
@@ -387,8 +509,8 @@ function draw() {
 function graphPoint(event) {
   const rect = canvas.getBoundingClientRect();
   return {
-    x: event.clientX - rect.left - state.pan.x,
-    y: event.clientY - rect.top - state.pan.y
+    x: (event.clientX - rect.left - state.pan.x) / state.zoom,
+    y: (event.clientY - rect.top - state.pan.y) / state.zoom
   };
 }
 
@@ -396,7 +518,7 @@ function hitNode(point) {
   for (const node of [...state.nodes.values()].reverse()) {
     const dx = point.x - node.x;
     const dy = point.y - node.y;
-    if (Math.sqrt(dx * dx + dy * dy) <= 24) return node;
+    if (Math.sqrt(dx * dx + dy * dy) <= nodeRadius(node) + 7) return node;
   }
   return null;
 }
@@ -412,7 +534,7 @@ function distanceToSegment(point, a, b) {
 
 function hitEdge(point) {
   for (const [key, edge] of state.edges) {
-    if (distanceToSegment(point, edge.from, edge.to) < 8) return { key, edge };
+    if (distanceToSegment(point, edge.from, edge.to) < 8 / state.zoom) return { key, edge };
   }
   return null;
 }
@@ -426,20 +548,17 @@ function updateSelectedDetails() {
     const node = state.nodes.get(state.selected.id);
     const incoming = [...state.edges.values()].filter(edge => edge.to.id === node.id).length;
     const outgoing = [...state.edges.values()].filter(edge => edge.from.id === node.id).length;
-    els.selectedDetails.innerHTML = `<strong>${node.name}</strong><br>Incoming: ${incoming}<br>Outgoing: ${outgoing}<br>${state.expanded.has(node.id) ? "Expanded" : "Not expanded yet"}`;
+    const aliases = node.aliases && node.aliases.length ? `<br>Aliases: ${node.aliases.slice(0, 4).join(", ")}` : "";
+    const action = state.expanded.has(node.id) ? "" : `<br><button id="expand-selected" type="button">Expand this entity</button>`;
+    els.selectedDetails.innerHTML = `<strong>${node.name}</strong><br>Incoming: ${incoming}<br>Outgoing: ${outgoing}<br>Popularity: ${Number(node.weightedPopularity || 0).toFixed(2)} weighted observations<br>Relative size: ${popularityPercent(node)}% of current max${aliases}<br>${state.expanded.has(node.id) ? "Expanded" : "Not expanded yet"}${action}`;
+    const button = document.querySelector("#expand-selected");
+    if (button) {
+      button.addEventListener("click", () => expandEntity(node.name).catch(error => setStatus(error.message)));
+    }
     return;
   }
   const edge = state.edges.get(state.selected.key);
   els.selectedDetails.innerHTML = `<strong>${edge.from.name} -> ${edge.to.name}</strong><br>Average confidence: ${edge.confidence.toFixed(3)}<br>Observations: ${edge.count}`;
-}
-
-function updateCost() {
-  const tokens = Math.max(0, Number(els.tokensPerCall.value) || 0);
-  const price = Math.max(0, Number(els.pricePerMillion.value) || 0);
-  const expandedCost = state.expanded.size * tokens / 1_000_000 * price;
-  const budget = Math.max(0, Number(els.autoBudget.value) || 0);
-  const budgetCost = budget * tokens / 1_000_000 * price;
-  els.costOutput.innerHTML = `Current expanded cost: <strong>$${expandedCost.toFixed(4)}</strong><br>Next auto run: <strong>$${budgetCost.toFixed(4)}</strong><br>Per 1,000 expansions: <strong>$${(tokens * 1000 / 1_000_000 * price).toFixed(2)}</strong>`;
 }
 
 function updateUi() {
@@ -450,20 +569,6 @@ function updateUi() {
   els.expandedCount.textContent = state.expanded.size;
   els.minConfidenceValue.textContent = Number(state.minConfidence).toFixed(2);
   updateSelectedDetails();
-  updateCost();
-
-  const frontier = getFrontier().slice(0, 30);
-  els.frontierList.innerHTML = "";
-  for (const node of frontier) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = node.name;
-    button.addEventListener("click", () => expandEntity(node.name).catch(error => setStatus(error.message)));
-    els.frontierList.appendChild(button);
-  }
-  if (!frontier.length) {
-    els.frontierList.textContent = "No frontier yet.";
-  }
 }
 
 canvas.addEventListener("pointerdown", event => {
@@ -508,14 +613,41 @@ canvas.addEventListener("pointerup", () => {
   state.lastPointer = null;
 });
 
+canvas.addEventListener("wheel", event => {
+  event.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const mouseX = event.clientX - rect.left;
+  const mouseY = event.clientY - rect.top;
+  const before = {
+    x: (mouseX - state.pan.x) / state.zoom,
+    y: (mouseY - state.pan.y) / state.zoom
+  };
+  const factor = Math.exp(-event.deltaY * 0.0012);
+  state.zoom = Math.max(0.25, Math.min(3, state.zoom * factor));
+  state.pan = {
+    x: mouseX - before.x * state.zoom,
+    y: mouseY - before.y * state.zoom
+  };
+  scheduleSave();
+}, { passive: false });
+
 canvas.addEventListener("dblclick", event => {
   const node = hitNode(graphPoint(event));
-  if (node) expandEntity(node.name).catch(error => setStatus(error.message));
+  if (!node) return;
+  if (state.devTools) {
+    expandEntity(node.name).catch(error => setStatus(error.message));
+    return;
+  }
+  focusNode(node, 1.15);
 });
 
 els.form.addEventListener("submit", event => {
   event.preventDefault();
-  expandEntity(els.input.value).catch(error => setStatus(error.message));
+  searchEntity(els.input.value).catch(error => setStatus(error.message));
+});
+
+els.focusEntity.addEventListener("click", () => {
+  searchEntity(els.input.value).catch(error => setStatus(error.message));
 });
 
 els.autoExpand.addEventListener("click", () => {
@@ -529,6 +661,7 @@ els.reset.addEventListener("click", () => {
   state.expanded.clear();
   state.selected = null;
   state.pan = { x: 0, y: 0 };
+  state.zoom = 1;
   setStatus("Reset.");
   scheduleSave();
   updateUi();
@@ -540,11 +673,8 @@ els.minConfidence.addEventListener("input", () => {
   updateUi();
 });
 
-els.tokensPerCall.addEventListener("input", updateCost);
-els.pricePerMillion.addEventListener("input", updateCost);
-els.autoBudget.addEventListener("input", updateCost);
 window.addEventListener("resize", resizeCanvas);
 
 resizeCanvas();
-loadGraph();
+loadConfig().then(loadGraph);
 draw();

@@ -8,6 +8,7 @@ const DATA_FILE = process.env.INFLUENCE_MAP_DATA_FILE || path.join(__dirname, "d
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+const DEV_TOOLS = process.env.INFLUENCE_MAP_DEV_TOOLS === "1";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -90,25 +91,45 @@ function sanitizeGraphData(data) {
   const savedAt = Number.isFinite(savedAtDate.valueOf()) ? savedAtDate.toISOString() : new Date().toISOString();
 
   const nodes = [];
-  const seenNodes = new Set();
+  const nodeById = new Map();
   for (const node of Array.isArray(data && data.nodes) ? data.nodes : []) {
     const name = normalizeName(node && node.name);
     const id = keyFor(name);
-    if (!id || seenNodes.has(id)) continue;
-    seenNodes.add(id);
-    nodes.push({
-      id,
-      name,
-      x: finiteNumber(node && node.x, 0),
-      y: finiteNumber(node && node.y, 0)
-    });
+    if (!id) continue;
+    const aliases = Array.isArray(node && node.aliases)
+      ? node.aliases.map(normalizeName).filter(Boolean)
+      : [];
+    if (!nodeById.has(id)) {
+      nodeById.set(id, {
+        id,
+        name,
+        aliases: [],
+        x: finiteNumber(node && node.x, 0),
+        y: finiteNumber(node && node.y, 0)
+      });
+    }
+    const current = nodeById.get(id);
+    for (const alias of [name, ...aliases]) {
+      if (alias && alias !== current.name && !current.aliases.includes(alias)) {
+        current.aliases.push(alias);
+      }
+    }
   }
+  nodes.push(...[...nodeById.values()].map(node => ({
+    ...node,
+    aliases: node.aliases.slice(0, 12)
+  })));
+  const nameById = new Map(nodes.map(node => [node.id, node.name]));
 
   const observations = [];
   for (const observation of Array.isArray(data && data.observations) ? data.observations : []) {
-    const from = normalizeName(observation && observation.from);
-    const to = normalizeName(observation && observation.to);
-    if (!from || !to || keyFor(from) === keyFor(to)) continue;
+    const rawFrom = normalizeName(observation && observation.from);
+    const rawTo = normalizeName(observation && observation.to);
+    const fromKey = keyFor(rawFrom);
+    const toKey = keyFor(rawTo);
+    if (!rawFrom || !rawTo || fromKey === toKey) continue;
+    const from = nameById.get(fromKey) || rawFrom;
+    const to = nameById.get(toKey) || rawTo;
     observations.push({
       from,
       to,
@@ -135,12 +156,19 @@ function sanitizeGraphData(data) {
       x: finiteNumber(data && data.pan && data.pan.x, 0),
       y: finiteNumber(data && data.pan && data.pan.y, 0)
     },
+    zoom: Math.max(0.25, Math.min(3, finiteNumber(data && data.zoom, 1))),
     minConfidence
   };
 }
 
 function keyFor(name) {
-  return normalizeName(name).toLowerCase();
+  return normalizeName(name)
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[()[\]{}'"`.,:;!?]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^the\s+/, "")
+    .trim();
 }
 
 function mockInfluences(entity) {
@@ -205,16 +233,8 @@ function mockInfluences(entity) {
   }
   return sanitizeInfluenceResponse(seed, {
     entity: seed,
-    influencedBy: [
-      { entity: `Early ${seed}`, confidence: 0.58 },
-      { entity: `${seed} predecessors`, confidence: 0.52 },
-      { entity: `Adjacent scene to ${seed}`, confidence: 0.47 }
-    ],
-    influenced: [
-      { entity: `Later works inspired by ${seed}`, confidence: 0.55 },
-      { entity: `${seed} revival movement`, confidence: 0.49 },
-      { entity: `Modern reinterpretations of ${seed}`, confidence: 0.44 }
-    ]
+    influencedBy: [],
+    influenced: []
   });
 }
 
@@ -266,11 +286,17 @@ async function handleApiInfluences(req, res) {
     const provider = body.provider || "deepseek";
     if (!entity) return sendJson(res, 400, { error: "Missing entity" });
 
-    if (provider === "mock" || !DEEPSEEK_API_KEY) {
+    if (provider === "mock") {
       return sendJson(res, 200, {
         provider: "mock",
         model: "local-demo",
         data: mockInfluences(entity)
+      });
+    }
+
+    if (!DEEPSEEK_API_KEY) {
+      return sendJson(res, 503, {
+        error: "Live generation is not configured. Start the server with DEEPSEEK_API_KEY or use mock mode in dev tools."
       });
     }
 
@@ -303,6 +329,20 @@ async function writeGraphData(data) {
   await fs.promises.mkdir(path.dirname(DATA_FILE), { recursive: true });
   await fs.promises.writeFile(DATA_FILE, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
   return graph;
+}
+
+async function normalizeGraphFile() {
+  try {
+    const raw = await fs.promises.readFile(DATA_FILE, "utf8");
+    const graph = sanitizeGraphData(JSON.parse(raw));
+    await fs.promises.mkdir(path.dirname(DATA_FILE), { recursive: true });
+    await fs.promises.writeFile(DATA_FILE, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+    console.log(`Normalized graph data at ${DATA_FILE}`);
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      console.warn(`Could not normalize graph data: ${error.message}`);
+    }
+  }
 }
 
 async function handleApiGraph(req, res) {
@@ -363,6 +403,13 @@ const server = http.createServer((req, res) => {
     handleApiGraph(req, res);
     return;
   }
+  if (req.method === "GET" && url.pathname === "/api/config") {
+    sendJson(res, 200, {
+      devTools: DEV_TOOLS,
+      provider: DEEPSEEK_API_KEY ? "deepseek" : "mock"
+    });
+    return;
+  }
   if (req.method === "GET") {
     serveStatic(req, res);
     return;
@@ -374,4 +421,5 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`Influence graph running at http://localhost:${PORT}`);
   console.log(DEEPSEEK_API_KEY ? `Using ${DEEPSEEK_MODEL}` : "No DEEPSEEK_API_KEY set; using mock mode");
+  normalizeGraphFile();
 });

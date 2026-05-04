@@ -13,6 +13,11 @@ Influence Map is a tiny prototype for exploring cultural influence as a generate
 - Frontier auto-expansion with a call budget
 - Simple LLM cost estimator
 - Server-side graph persistence to a local JSON file
+- Existing-node search with graph focus
+- Wheel/trackpad zoom and drag panning
+- Deterministic name dedupe for simple variants
+- Node size based on weighted observation prominence
+- Public search mode with bulk expansion controls hidden by default
 
 ## Requirements
 
@@ -54,6 +59,19 @@ $env:INFLUENCE_MAP_DATA_FILE="C:\tmp\influence-map.json"
 npm start
 ```
 
+The server also normalizes the saved graph on startup so older duplicate node variants are folded through the current deterministic dedupe rules.
+
+## Dev Tools
+
+Bulk frontier expansion and reset controls are hidden from normal visitors. To enable them for local curation:
+
+```powershell
+$env:INFLUENCE_MAP_DEV_TOOLS="1"
+npm start
+```
+
+The UI always requests DeepSeek for generation. Searching for a missing entity requires live generation; if no `DEEPSEEK_API_KEY` is configured, the server returns an error instead of adding generic placeholder relationships.
+
 ## Data Shape
 
 Each model response is expected to be strict JSON:
@@ -78,6 +96,8 @@ Joy Division -> Interpol
 ```
 
 Repeated observations for the same directed edge are averaged into one visible graph edge.
+
+Entity names are deduped with a cheap deterministic key: case, punctuation, whitespace, leading `the`, and `&`/`and` variants are normalized before nodes and edges are merged. Popularity is the unbounded weighted number of observations connected to that entity, so prominence emerges from repeated graph evidence rather than another LLM field. Circle size is a relative visual scale based on the current graph's most prominent entity, while the raw popularity score keeps growing.
 
 ## Notes
 
