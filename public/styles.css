@@ -369,6 +369,40 @@ tbody tr:hover {
   font-size: 22px;
 }
 
+.panel-overview {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: -6px 0 14px;
+}
+
+.panel-overview button {
+  min-height: 46px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  background: #ffffff;
+  text-align: left;
+}
+
+.panel-overview span,
+.panel-overview strong {
+  display: block;
+}
+
+.panel-overview span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.panel-overview strong {
+  overflow: hidden;
+  margin-top: 2px;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .activity-list {
   display: grid;
   gap: 7px;
@@ -418,6 +452,32 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+.activity-stages {
+  display: grid;
+  gap: 4px;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-stages li {
+  position: relative;
+  padding-left: 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.activity-stages li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0.6em;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent-2);
+}
+
 .prompt-button {
   min-height: 0;
   margin-top: 6px;
@@ -435,6 +495,11 @@ tbody tr:hover {
 
 .activity-item.running {
   border-left-color: var(--accent-2);
+}
+
+.activity-item.slow {
+  border-left-color: #c7831d;
+  background: #fffaf0;
 }
 
 .activity-item.done {
@@ -695,6 +760,82 @@ h2 {
   border-color: var(--accent);
 }
 
+.diagnostics-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.diagnostics-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.diagnostic-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.diagnostic-grid div,
+.diagnostic-profile {
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.diagnostic-grid span,
+.diagnostic-grid strong,
+.diagnostic-profile strong,
+.diagnostic-profile span,
+.diagnostic-profile em {
+  display: block;
+}
+
+.diagnostic-grid span,
+.diagnostic-profile span,
+.diagnostic-profile em {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diagnostic-grid strong {
+  overflow: hidden;
+  margin-top: 2px;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagnostics-output h3 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+}
+
+.diagnostic-profiles {
+  display: grid;
+  gap: 8px;
+}
+
+.diagnostic-profile {
+  border-left: 4px solid var(--accent);
+}
+
+.diagnostic-profile.failed {
+  border-left-color: #b4472f;
+}
+
+.diagnostic-profile.slow {
+  border-left-color: #c7831d;
+  background: #fffaf0;
+}
+
+.diagnostic-profile em {
+  margin-top: 4px;
+  color: #b4472f;
+  font-style: normal;
+}
+
 .guide {
   display: grid;
   gap: 9px;
@@ -765,6 +906,22 @@ h2 {
 
 .line-swatch.faint::after {
   border-left-color: rgba(102, 112, 109, 0.45);
+}
+
+.line-swatch.incoming::before {
+  background: rgba(44, 111, 187, 0.88);
+}
+
+.line-swatch.incoming::after {
+  border-left-color: rgba(44, 111, 187, 0.88);
+}
+
+.line-swatch.outgoing::before {
+  background: rgba(191, 112, 38, 0.9);
+}
+
+.line-swatch.outgoing::after {
+  border-left-color: rgba(191, 112, 38, 0.9);
 }
 
 .size-swatch {

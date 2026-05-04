@@ -1,5 +1,6 @@
 const canvas = document.querySelector("#graph-canvas");
 const ctx = canvas.getContext("2d");
+let activityTicker = 0;
 
 const state = {
   nodes: new Map(),
@@ -17,6 +18,7 @@ const state = {
   lastPointer: null,
   minConfidence: 0,
   loaded: false,
+  searching: false,
   saveTimer: null,
   saveVersion: 0,
   maxWeightedPopularity: 0
@@ -27,6 +29,7 @@ const state = {
   tableFilter: "",
   identityFilter: "all",
   identitySuggestions: [],
+  diagnostics: null,
   panelTab: "selected",
   activities: [],
   activityCounter: 0
@@ -54,10 +57,15 @@ const els = {
   edgeCount: document.querySelector("#edge-count"),
   observationCount: document.querySelector("#observation-count"),
   expandedCount: document.querySelector("#expanded-count"),
+  activitySummary: document.querySelector("#activity-summary"),
+  identitySummary: document.querySelector("#identity-summary"),
   activityList: document.querySelector("#activity-list"),
   selectedDetails: document.querySelector("#selected-details"),
   dedupeReview: document.querySelector("#dedupe-review"),
   dedupeOutput: document.querySelector("#dedupe-output"),
+  refreshDiagnostics: document.querySelector("#refresh-diagnostics"),
+  runBenchmark: document.querySelector("#run-benchmark"),
+  diagnosticsOutput: document.querySelector("#diagnostics-output"),
   identityFilters: document.querySelectorAll("[data-identity-filter]"),
   panelTabs: document.querySelectorAll("[data-panel-tab]"),
   panelPages: document.querySelectorAll("[data-panel-page]"),
@@ -68,6 +76,8 @@ const els = {
 
 const MIN_ZOOM = 0.04;
 const MAX_ZOOM = 8;
+const SLOW_LLM_MS = 10000;
+const VERY_SLOW_LLM_MS = 25000;
 
 const adminParam = new URLSearchParams(window.location.search).get("admin");
 if (adminParam) {
@@ -326,6 +336,17 @@ function highlightedNodeIds() {
   return ids;
 }
 
+function focusNodeId() {
+  return selectedNodeId() || state.hovered || "";
+}
+
+function edgeDirectionFor(edge, rootId) {
+  if (!rootId) return "";
+  if (edge.to.id === rootId) return "incoming";
+  if (edge.from.id === rootId) return "outgoing";
+  return "";
+}
+
 function fitGraph() {
   const nodes = [...state.nodes.values()];
   if (!nodes.length) return;
@@ -490,6 +511,8 @@ function addActivity(type, title, detail = "", status = "queued", prompt = null)
     detail: displayName(detail),
     status,
     prompt,
+    stages: [],
+    startedAt: status === "running" ? Date.now() : null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   };
@@ -502,8 +525,176 @@ function addActivity(type, title, detail = "", status = "queued", prompt = null)
 function updateActivity(id, patch = {}) {
   const activity = state.activities.find(item => item.id === id);
   if (!activity) return;
+  if (patch.status === "running" && !activity.startedAt) patch.startedAt = Date.now();
   Object.assign(activity, patch, { updatedAt: new Date().toISOString() });
   renderActivityList();
+  const hasRunning = state.activities.some(item => item.status === "running" && item.startedAt);
+  if (hasRunning && !activityTicker) {
+    activityTicker = window.setInterval(() => {
+      if (!state.activities.some(item => item.status === "running" && item.startedAt)) {
+        window.clearInterval(activityTicker);
+        activityTicker = 0;
+        return;
+      }
+      renderActivityList();
+    }, 1000);
+  }
+  updateOverview();
+}
+
+function updateOverview() {
+  if (els.activitySummary) {
+    const running = state.activities.find(item => item.status === "running");
+    const latest = running || state.activities[0];
+    els.activitySummary.querySelector("strong").textContent = latest
+      ? running
+        ? `${latest.title} (${activityElapsed(latest) || "running"})`
+        : latest.title
+      : "Idle";
+  }
+  if (els.identitySummary) {
+    const pending = state.identitySuggestions.length;
+    const merges = state.identitySuggestions.filter(item => identityActionFor(item) === "merge").length;
+    const splits = state.identitySuggestions.filter(item => identityActionFor(item) === "split").length;
+    els.identitySummary.querySelector("strong").textContent = pending
+      ? `${pending} pending (${merges}M/${splits}S)`
+      : "0 pending";
+  }
+}
+
+function activityElapsed(activity) {
+  if (!activity.startedAt || activity.status !== "running") return "";
+  return `${Math.max(1, Math.round((Date.now() - activity.startedAt) / 1000))}s`;
+}
+
+function formatTimings(timings) {
+  if (!Array.isArray(timings) || !timings.length) return "";
+  return timings
+    .filter(item => item && item.stage !== "total" && Number.isFinite(Number(item.ms)))
+    .map(item => `${item.stage} ${(Number(item.ms) / 1000).toFixed(1)}s`)
+    .join(", ");
+}
+
+function formatMs(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value)) return "n/a";
+  return value >= 1000 ? `${(value / 1000).toFixed(2)}s` : `${Math.round(value)}ms`;
+}
+
+function profileTotal(profile) {
+  const total = Array.isArray(profile.timings)
+    ? profile.timings.find(item => item && item.stage === "total")
+    : null;
+  return total ? total.ms : 0;
+}
+
+function renderDiagnosticsLegacy(payload = state.diagnostics) {
+  if (!els.diagnosticsOutput) return;
+  if (!payload) {
+    els.diagnosticsOutput.textContent = "Diagnostics have not loaded yet.";
+    return;
+  }
+  const queue = payload.llmQueue || {};
+  const counts = payload.counts || {};
+  const profiles = Array.isArray(payload.profiles) ? payload.profiles.slice(0, 12) : [];
+  const profileRows = profiles.length ? profiles.map(profile => {
+    const llm = profile.llm || {};
+    const usage = profile.usage && profile.usage.expansion ? profile.usage.expansion : {};
+    const status = profile.error ? "failed" : "done";
+    return `
+      <div class="diagnostic-profile ${status}">
+        <strong>${escapeHtml(profile.entity || profile.type || "event")}</strong>
+        <span>${escapeHtml(profile.type || "profile")} · ${escapeHtml(profile.provider || "")}/${escapeHtml(profile.model || "")}</span>
+        <span>Total ${escapeHtml(formatMs(profileTotal(profile)))} · Request ${escapeHtml(formatMs(llm.expansionRequestMs || llm.identityRequestMs))} · Queue ${escapeHtml(formatMs(llm.expansionQueueMs || llm.identityQueueMs || 0))}</span>
+        <span>Tokens ${Number(usage.totalTokens || 0)} · reasoning ${Number(usage.reasoningTokens || 0)} · ${escapeHtml(activityTime(profile.at))}</span>
+        ${profile.error ? `<em>${escapeHtml(profile.error)}</em>` : ""}
+      </div>
+    `;
+  }).join("") : "<p>No profiles recorded yet.</p>";
+  els.diagnosticsOutput.innerHTML = `
+    <div class="diagnostic-grid">
+      <div><span>Provider</span><strong>${escapeHtml(payload.provider || "mock")}</strong></div>
+      <div><span>Model</span><strong>${escapeHtml(payload.model || "none")}</strong></div>
+      <div><span>Thinking</span><strong>${escapeHtml(payload.thinking || "n/a")}</strong></div>
+      <div><span>JSON mode</span><strong>${payload.openRouterJsonMode ? "Fast" : "Strict"}</strong></div>
+      <div><span>Queue</span><strong>${Number(queue.active || 0)} active / ${Number(queue.queued || 0)} waiting</strong></div>
+      <div><span>Timeout</span><strong>${escapeHtml(formatMs(queue.timeoutMs))}</strong></div>
+      <div><span>Database</span><strong>${Number(counts.nodes || 0)} nodes / ${Number(counts.observations || 0)} obs</strong></div>
+      <div><span>Profile errors</span><strong>${Number(counts.errors || 0)}</strong></div>
+    </div>
+    <h3>Recent Model Runs</h3>
+    <div class="diagnostic-profiles">${profileRows}</div>
+  `;
+}
+
+function renderDiagnostics(payload = state.diagnostics) {
+  if (!els.diagnosticsOutput) return;
+  if (!payload) {
+    els.diagnosticsOutput.textContent = "Diagnostics have not loaded yet.";
+    return;
+  }
+  const queue = payload.llmQueue || {};
+  const counts = payload.counts || {};
+  const profiles = Array.isArray(payload.profiles) ? payload.profiles.slice(0, 12) : [];
+  const slowThresholdMs = Number(payload.slowThresholdMs || SLOW_LLM_MS);
+  const profileRows = profiles.length ? profiles.map(profile => {
+    const llm = profile.llm || {};
+    const usage = profile.usage && profile.usage.expansion ? profile.usage.expansion : {};
+    const requestMs = Number(llm.expansionRequestMs || llm.identityRequestMs || 0);
+    const totalMs = Number(profileTotal(profile));
+    const isSlow = requestMs >= slowThresholdMs || totalMs >= slowThresholdMs;
+    const status = profile.error ? "failed" : isSlow ? "slow" : "done";
+    const slowLabel = isSlow ? "Slow provider wait - " : "";
+    return `
+      <div class="diagnostic-profile ${status}">
+        <strong>${escapeHtml(profile.entity || profile.type || "event")}</strong>
+        <span>${escapeHtml(profile.type || "profile")} - ${escapeHtml(profile.provider || "")}/${escapeHtml(profile.model || "")}</span>
+        <span>${escapeHtml(slowLabel)}Total ${escapeHtml(formatMs(totalMs))} - Provider request ${escapeHtml(formatMs(requestMs))} - Queue ${escapeHtml(formatMs(llm.expansionQueueMs || llm.identityQueueMs || 0))}</span>
+        <span>Tokens ${Number(usage.totalTokens || 0)} - reasoning ${Number(usage.reasoningTokens || 0)} - ${escapeHtml(activityTime(profile.at))}</span>
+        ${profile.error ? `<em>${escapeHtml(profile.error)}</em>` : ""}
+      </div>
+    `;
+  }).join("") : "<p>No profiles recorded yet.</p>";
+  els.diagnosticsOutput.innerHTML = `
+    <div class="diagnostic-grid">
+      <div><span>Provider</span><strong>${escapeHtml(payload.provider || "mock")}</strong></div>
+      <div><span>Model</span><strong>${escapeHtml(payload.model || "none")}</strong></div>
+      <div><span>Thinking</span><strong>${escapeHtml(payload.thinking || "n/a")}</strong></div>
+      <div><span>JSON mode</span><strong>${payload.openRouterJsonMode ? "Fast" : "Strict"}</strong></div>
+      <div><span>Queue</span><strong>${Number(queue.active || 0)} active / ${Number(queue.queued || 0)} waiting</strong></div>
+      <div><span>Timeout</span><strong>${escapeHtml(formatMs(queue.timeoutMs))}</strong></div>
+      <div><span>Database</span><strong>${Number(counts.nodes || 0)} nodes / ${Number(counts.observations || 0)} obs</strong></div>
+      <div><span>Profile errors</span><strong>${Number(counts.errors || 0)}</strong></div>
+      <div><span>Slow runs</span><strong>${Number(counts.slowProfiles || 0)}</strong></div>
+    </div>
+    <h3>Recent Model Runs</h3>
+    <div class="diagnostic-profiles">${profileRows}</div>
+  `;
+}
+
+async function loadDiagnostics() {
+  if (!state.devTools || !els.diagnosticsOutput) return null;
+  els.diagnosticsOutput.textContent = "Loading diagnostics...";
+  const response = await fetch("/api/diagnostics", { headers: adminHeaders() });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Could not load diagnostics");
+  state.diagnostics = payload;
+  renderDiagnostics(payload);
+  return payload;
+}
+
+async function runBenchmark() {
+  if (!state.devTools || !els.diagnosticsOutput) return;
+  els.diagnosticsOutput.textContent = "Running model benchmark...";
+  const response = await fetch("/api/llm-benchmark", {
+    method: "POST",
+    headers: adminHeaders()
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Benchmark failed");
+  const rows = (payload.results || []).map(result => `${result.mode}: ${formatMs(result.ms)} (${Number(result.usage && result.usage.totalTokens || 0)} tokens)`).join(" | ");
+  setStatus(`Benchmark: ${rows}`);
+  await loadDiagnostics();
 }
 
 function promptTextFor(prompt) {
@@ -662,17 +853,24 @@ function renderActivityList() {
   }
   els.activityList.innerHTML = state.activities.map(activity => {
     const hasPrompt = Boolean(promptTextFor(activity.prompt));
+    const stages = Array.isArray(activity.stages) && activity.stages.length
+      ? `<ol class="activity-stages">${activity.stages.map(stage => `<li>${escapeHtml(stage)}</li>`).join("")}</ol>`
+      : "";
+    const elapsed = activityElapsed(activity);
+    const classes = [activity.status, activity.slow ? "slow" : ""].filter(Boolean).join(" ");
     return `
-    <div class="activity-item ${escapeHtml(activity.status)}" data-activity="${escapeHtml(activity.id)}">
+    <div class="activity-item ${escapeHtml(classes)}" data-activity="${escapeHtml(activity.id)}">
       <div>
         <strong>${escapeHtml(activity.title)}</strong>
         <span>${escapeHtml(activity.detail || activity.type)}</span>
+        ${stages}
         ${hasPrompt ? `<button type="button" class="prompt-button" data-prompt-activity="${escapeHtml(activity.id)}">View prompt</button>` : ""}
       </div>
-      <em>${escapeHtml(activity.status)} ${escapeHtml(activityTime(activity.updatedAt))}</em>
+      <em>${escapeHtml(activity.status)} ${escapeHtml(elapsed || activityTime(activity.updatedAt))}</em>
     </div>
   `;
   }).join("");
+  updateOverview();
 }
 
 function serializeGraph() {
@@ -838,7 +1036,7 @@ async function fetchInfluences(entity, context = {}) {
   const response = await fetch("/api/influences", {
     method: "POST",
     headers: { "content-type": "application/json", ...adminHeaders() },
-    body: JSON.stringify({ entity, provider: "deepseek", context })
+    body: JSON.stringify({ entity, context })
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Request failed");
@@ -910,9 +1108,13 @@ function renderDedupeSuggestions(suggestions) {
   if (!els.dedupeOutput) return;
   if (!suggestions || !suggestions.length) {
     updateIdentityFilterButtons([]);
+    state.identitySuggestions = [];
+    updateOverview();
     els.dedupeOutput.textContent = "No pending identity decisions.";
     return;
   }
+  state.identitySuggestions = suggestions;
+  updateOverview();
   updateIdentityFilterButtons(suggestions);
   const visible = state.identityFilter === "all"
     ? suggestions
@@ -993,7 +1195,11 @@ async function expandEntity(entity, options = {}) {
   const node = ensureNode(entity);
   if (!node) return;
   if (state.expanding.has(node.id)) return;
-  const activityId = options.activityId || addActivity("expand", `Expand ${node.name}`, "Waiting for DeepSeek", "queued");
+  if (state.expanding.size && !options.allowConcurrent) {
+    setStatus("A model expansion is already running. Wait for it to finish before starting another.");
+    return;
+  }
+  const activityId = options.activityId || addActivity("expand", `Expand ${node.name}`, "Waiting for model", "queued");
   const context = expansionContextFor(node);
   const contextCount = context.discoveredFrom.length + context.connectedTo.length;
   state.expanding.add(node.id);
@@ -1001,10 +1207,15 @@ async function expandEntity(entity, options = {}) {
   updateActivity(activityId, {
     status: "running",
     title: `Expand ${node.name}`,
-    detail: contextCount ? `DeepSeek using ${contextCount} local context clues` : "DeepSeek request in progress"
+    detail: contextCount
+      ? `Preparing prompt with ${contextCount} local context clues`
+      : "Preparing model prompt",
+    stages: ["Local context ready", "Waiting for model expansion"]
   });
   setStatus(`Expanding ${node.name}...`);
   updateUi();
+  let slowProviderTimer = 0;
+  let verySlowProviderTimer = 0;
   try {
     const beforeNodeCount = state.nodes.size;
     const beforeEdgeCount = state.edges.size + state.hiddenEdges.size;
@@ -1014,12 +1225,38 @@ async function expandEntity(entity, options = {}) {
         if (prompt) updateActivity(activityId, { prompt });
       })
       .catch(error => updateActivity(activityId, { detail: `Prompt preview unavailable: ${error.message}` }));
+    updateActivity(activityId, {
+      detail: "Model is generating influence links...",
+      stages: ["Local context ready", "Prompt preview running in parallel", "Model expansion in progress"]
+    });
+    slowProviderTimer = window.setTimeout(() => {
+      updateActivity(activityId, {
+        slow: true,
+        detail: "Still waiting on the model provider. The app is alive; this is provider request time.",
+        stages: ["Local context ready", "Prompt preview running in parallel", "Provider request still running"]
+      });
+      setStatus(`${node.name} is still waiting on the model provider...`);
+      if (state.devTools) loadDiagnostics().catch(() => {});
+    }, SLOW_LLM_MS);
+    verySlowProviderTimer = window.setTimeout(() => {
+      updateActivity(activityId, {
+        slow: true,
+        detail: "Provider request is unusually slow and may timeout if no response arrives.",
+        stages: ["Local context ready", "Prompt preview running in parallel", "Provider request unusually slow"]
+      });
+      if (state.devTools) loadDiagnostics().catch(() => {});
+    }, VERY_SLOW_LLM_MS);
     const payload = await fetchInfluences(node.name, context);
+    window.clearTimeout(slowProviderTimer);
+    window.clearTimeout(verySlowProviderTimer);
+    slowProviderTimer = 0;
+    verySlowProviderTimer = 0;
     if (payload.debugPrompt) updateActivity(activityId, { prompt: payload.debugPrompt });
     if (payload.identity) {
       const identityPercent = Math.round(Number(payload.identity.confidence || 0) * 100);
       updateActivity(activityId, {
-        detail: `Identity ${payload.identity.decision}: ${payload.identity.canonicalName} (${identityPercent}%), applying expansion`
+        detail: `Identity ${payload.identity.decision}: ${payload.identity.canonicalName} (${identityPercent}%), applying expansion`,
+        stages: ["Identity resolved", "Applying graph observations", "Queuing identity review"]
       });
     }
     if ((payload.identitySuggestions || payload.localHygieneSuggestions || payload.llmHygieneSuggestions) && state.devTools) {
@@ -1074,20 +1311,31 @@ async function expandEntity(entity, options = {}) {
     const resolvedDetail = payload.identity && payload.identity.canonicalName !== node.name
       ? ` Identity checked as ${payload.identity.canonicalName}.`
       : "";
+    const timingDetail = formatTimings(payload.timings);
+    const llm = payload.llm || {};
+    const providerMs = Number(llm.expansionRequestMs || 0);
+    const providerDetail = providerMs >= SLOW_LLM_MS ? ` Provider wait: ${formatMs(providerMs)}.` : "";
+    const hygieneDetail = payload.hygieneQueued ? " LLM identity hygiene queued after expansion." : "";
     updateActivity(activityId, {
       status: "done",
       title: resultTitle,
-      detail: `${resultDetail}${resolvedDetail}${identityDetail}`
+      slow: providerMs >= SLOW_LLM_MS,
+      detail: `${resultDetail}${resolvedDetail}${identityDetail}${hygieneDetail}${providerDetail}${timingDetail ? ` Timing: ${timingDetail}.` : ""}`,
+      stages: []
     });
     setStatus(shapeChanged
       ? `${wasExpanded ? "Sampled" : "Expanded"} ${canonicalEntity} using ${payload.provider}/${payload.model}.`
       : `${canonicalEntity} returned existing relationships only; confidence evidence was reinforced but the map shape did not grow.`);
     scheduleSave();
     window.setTimeout(scheduleSave, 2500);
+    if (state.panelTab === "diagnostics") loadDiagnostics().catch(() => {});
   } catch (error) {
     updateActivity(activityId, { status: "failed", detail: error.message || "Expansion failed" });
+    if (state.panelTab === "diagnostics") loadDiagnostics().catch(() => {});
     throw error;
   } finally {
+    window.clearTimeout(slowProviderTimer);
+    window.clearTimeout(verySlowProviderTimer);
     state.expanding.delete(node.id);
     state.expanding.delete(keyFor(entity));
     updateUi();
@@ -1095,21 +1343,29 @@ async function expandEntity(entity, options = {}) {
 }
 
 async function searchEntity(entity) {
+  if (state.searching) return;
   const query = displayName(entity);
   if (!query) return;
-  const existing = findNodeByQuery(query);
-  if (existing) {
-    focusNode(existing, 1.15);
-    if (!state.expanded.has(existing.id)) {
-      await expandEntity(existing.name);
+  state.searching = true;
+  els.focusEntity.disabled = true;
+  try {
+    const existing = findNodeByQuery(query);
+    if (existing) {
       focusNode(existing, 1.15);
+      if (!state.expanded.has(existing.id)) {
+        await expandEntity(existing.name);
+        focusNode(existing, 1.15);
+      }
+      return;
     }
-    return;
+    setStatus(`No existing node found for "${query}". Expanding it now...`);
+    await expandEntity(query);
+    const created = findNodeByQuery(query);
+    if (created) focusNode(created, 1.15);
+  } finally {
+    state.searching = false;
+    els.focusEntity.disabled = false;
   }
-  setStatus(`No existing node found for "${query}". Expanding it now...`);
-  await expandEntity(query);
-  const created = findNodeByQuery(query);
-  if (created) focusNode(created, 1.15);
 }
 
 function getFrontier() {
@@ -1192,7 +1448,7 @@ function simulatePhysics() {
   }
 }
 
-function drawArrow(from, to, confidence, count, selected, hidden = false, faded = false) {
+function drawArrow(from, to, confidence, count, selected, hidden = false, faded = false, direction = "") {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
@@ -1206,12 +1462,18 @@ function drawArrow(from, to, confidence, count, selected, hidden = false, faded 
   const weak = confidence < 0.35;
   const dashed = hidden || (weak && !selected);
 
-  ctx.strokeStyle = hidden
-    ? `rgba(102, 112, 109, ${faded ? 0.06 : 0.18})`
-    : selected
-      ? "#b4472f"
-      : `rgba(31, 35, 38, ${faded ? 0.08 : weak ? 0.16 + confidence * 0.34 : 0.2 + confidence * 0.48})`;
-  ctx.lineWidth = hidden ? 1 : weak ? Math.max(1, width * 0.72) : width;
+  const directional = direction === "incoming" || direction === "outgoing";
+  const alpha = hidden ? (faded ? 0.06 : 0.2) : faded ? 0.08 : weak ? 0.16 + confidence * 0.34 : 0.2 + confidence * 0.48;
+  ctx.strokeStyle = directional
+    ? direction === "incoming"
+      ? `rgba(44, 111, 187, ${hidden ? 0.42 : 0.88})`
+      : `rgba(191, 112, 38, ${hidden ? 0.42 : 0.9})`
+    : hidden
+      ? `rgba(102, 112, 109, ${alpha})`
+      : selected
+        ? "#b4472f"
+        : `rgba(31, 35, 38, ${alpha})`;
+  ctx.lineWidth = directional ? Math.max(2.2, width + 0.8) : hidden ? 1 : weak ? Math.max(1, width * 0.72) : width;
   if (dashed) ctx.setLineDash([5, 7]);
   ctx.beginPath();
   ctx.moveTo(startX, startY);
@@ -1238,17 +1500,18 @@ function draw() {
   ctx.translate(state.pan.x, state.pan.y);
   ctx.scale(state.zoom, state.zoom);
   const highlights = highlightedNodeIds();
+  const rootId = focusNodeId();
   const hasFocus = highlights.size > 0;
 
   for (const edge of state.hiddenEdges.values()) {
     const related = !hasFocus || (highlights.has(edge.from.id) && highlights.has(edge.to.id));
-    drawArrow(edge.from, edge.to, edge.confidence, edge.count, false, true, !related);
+    drawArrow(edge.from, edge.to, edge.confidence, edge.count, false, true, !related, edgeDirectionFor(edge, rootId));
   }
 
   for (const [key, edge] of state.edges) {
     const selected = state.selected && state.selected.type === "edge" && state.selected.key === key;
     const related = !hasFocus || selected || (highlights.has(edge.from.id) && highlights.has(edge.to.id));
-    drawArrow(edge.from, edge.to, edge.confidence, edge.count, selected, false, !related);
+    drawArrow(edge.from, edge.to, edge.confidence, edge.count, selected, false, !related, edgeDirectionFor(edge, rootId));
   }
 
   for (const node of state.nodes.values()) {
@@ -1418,6 +1681,10 @@ canvas.addEventListener("pointermove", event => {
   }
 });
 
+canvas.addEventListener("pointerleave", () => {
+  state.hovered = null;
+});
+
 canvas.addEventListener("pointerup", () => {
   if (state.dragging || state.lastPointer) scheduleSave();
   state.dragging = null;
@@ -1471,8 +1738,43 @@ els.centerSelected.addEventListener("click", () => {
 });
 
 els.panelTabs.forEach(button => {
-  button.addEventListener("click", () => setPanelTab(button.getAttribute("data-panel-tab")));
+  button.addEventListener("click", () => {
+    const tab = button.getAttribute("data-panel-tab");
+    setPanelTab(tab);
+    if (tab === "diagnostics") {
+      loadDiagnostics().catch(error => {
+        if (els.diagnosticsOutput) els.diagnosticsOutput.textContent = error.message;
+        setStatus(error.message);
+      });
+    }
+  });
 });
+
+if (els.activitySummary) {
+  els.activitySummary.addEventListener("click", () => setPanelTab("activity"));
+}
+
+if (els.identitySummary) {
+  els.identitySummary.addEventListener("click", () => setPanelTab("dedupe"));
+}
+
+if (els.refreshDiagnostics) {
+  els.refreshDiagnostics.addEventListener("click", () => {
+    loadDiagnostics().catch(error => {
+      if (els.diagnosticsOutput) els.diagnosticsOutput.textContent = error.message;
+      setStatus(error.message);
+    });
+  });
+}
+
+if (els.runBenchmark) {
+  els.runBenchmark.addEventListener("click", () => {
+    runBenchmark().catch(error => {
+      if (els.diagnosticsOutput) els.diagnosticsOutput.textContent = error.message;
+      setStatus(error.message);
+    });
+  });
+}
 
 els.activityList.addEventListener("click", event => {
   const button = event.target.closest("[data-prompt-activity]");
@@ -1518,7 +1820,7 @@ els.autoExpand.addEventListener("click", () => {
 });
 
 els.dedupeReview.addEventListener("click", async () => {
-  const activityId = addActivity("identity", "Full identity sweep", "DeepSeek review in progress", "running");
+  const activityId = addActivity("identity", "Full identity sweep", "Model review in progress", "running");
   els.dedupeOutput.textContent = "Running a broader identity sweep and adding decisions to the approval list...";
   try {
     const response = await fetch("/api/dedupe-review", {

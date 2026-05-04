@@ -10,8 +10,20 @@ const DB_FILE = process.env.INFLUENCE_MAP_DB_FILE || path.join(__dirname, "data"
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
+const DEEPSEEK_THINKING = process.env.DEEPSEEK_THINKING || "disabled";
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-3.1-flash-lite-preview";
+const OPENROUTER_BASE_URL = process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
+const OPENROUTER_REASONING = process.env.OPENROUTER_REASONING || "none";
+const DEFAULT_LLM_PROVIDER = (process.env.INFLUENCE_MAP_LLM_PROVIDER || "deepseek").toLowerCase();
+const LLM_MAX_CONCURRENCY = Math.max(1, Number(process.env.INFLUENCE_MAP_LLM_CONCURRENCY || 1) || 1);
+const LLM_REQUEST_TIMEOUT_MS = Math.max(10_000, Number(process.env.INFLUENCE_MAP_LLM_TIMEOUT_MS || 45_000) || 45_000);
+const LLM_MAX_TOKENS = Math.max(0, Number(process.env.INFLUENCE_MAP_LLM_MAX_TOKENS || 0) || 0);
 const DEV_TOOLS = process.env.INFLUENCE_MAP_DEV_TOOLS === "1";
 const ADMIN_TOKEN = process.env.INFLUENCE_MAP_ADMIN_TOKEN || "";
+const profileEvents = [];
+let activeLlmRequests = 0;
+const queuedLlmRequests = [];
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -42,6 +54,257 @@ function readBody(req, maxBytes = 1_000_000) {
     req.on("end", () => resolve(body));
     req.on("error", reject);
   });
+}
+
+function deepSeekRequestBody({ messages, temperature, maxTokens }) {
+  const body = {
+    model: DEEPSEEK_MODEL,
+    messages,
+    response_format: { type: "json_object" },
+    thinking: { type: DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled" },
+    temperature
+  };
+  if (Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
+  return body;
+}
+
+function providerConfig(providerName = DEFAULT_LLM_PROVIDER) {
+  const provider = normalizeName(providerName).toLowerCase();
+  if (provider === "openrouter" || provider === "google") {
+    return {
+      provider: "openrouter",
+      apiKey: OPENROUTER_API_KEY,
+      model: OPENROUTER_MODEL,
+      baseUrl: OPENROUTER_BASE_URL.replace(/\/$/, ""),
+      endpoint: "/chat/completions"
+    };
+  }
+  return {
+    provider: "deepseek",
+    apiKey: DEEPSEEK_API_KEY,
+    model: DEEPSEEK_MODEL,
+    baseUrl: DEEPSEEK_BASE_URL.replace(/\/$/, ""),
+    endpoint: "/chat/completions"
+  };
+}
+
+const influenceResponseSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    entity: { type: "string" },
+    influencedBy: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          entity: { type: "string" },
+          confidence: { type: "number" }
+        },
+        required: ["entity", "confidence"]
+      }
+    },
+    influenced: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          entity: { type: "string" },
+          confidence: { type: "number" }
+        },
+        required: ["entity", "confidence"]
+      }
+    }
+  },
+  required: ["entity", "influencedBy", "influenced"]
+};
+
+const identityResponseSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    canonicalName: { type: "string" },
+    displayName: { type: "string" },
+    disambiguation: { type: "string" },
+    aliases: { type: "array", items: { type: "string" } },
+    decision: { type: "string", enum: ["same", "rename", "merge", "split", "new", "uncertain"] },
+    confidence: { type: "number" },
+    reason: { type: "string" }
+  },
+  required: ["canonicalName", "displayName", "disambiguation", "aliases", "decision", "confidence", "reason"]
+};
+
+const dedupeResponseSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    groups: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          canonical: { type: "string" },
+          entities: { type: "array", items: { type: "string" } },
+          confidence: { type: "number" },
+          reason: { type: "string" }
+        },
+        required: ["canonical", "entities", "confidence", "reason"]
+      }
+    }
+  },
+  required: ["groups"]
+};
+
+const scopedIdentityResponseSchema = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    groups: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          action: { type: "string", enum: ["merge", "split", "keep-separate"] },
+          canonical: { type: "string" },
+          entities: { type: "array", items: { type: "string" } },
+          confidence: { type: "number" },
+          reason: { type: "string" }
+        },
+        required: ["action", "canonical", "entities", "confidence", "reason"]
+      }
+    }
+  },
+  required: ["groups"]
+};
+
+function structuredResponseFormat(name, schema) {
+  return {
+    type: "json_schema",
+    json_schema: {
+      name,
+      strict: true,
+      schema
+    }
+  };
+}
+
+function llmResponseFormat({ responseSchemaName, responseSchema, jsonModeOnly }) {
+  if (jsonModeOnly || !responseSchema) return { type: "json_object" };
+  return structuredResponseFormat(responseSchemaName || "influence_map_response", responseSchema);
+}
+
+function llmRequestBody(config, { messages, temperature, maxTokens, responseSchemaName, responseSchema, jsonModeOnly }) {
+  if (config.provider === "deepseek") return deepSeekRequestBody({ messages, temperature, maxTokens });
+  const body = {
+    model: config.model,
+    messages,
+    response_format: llmResponseFormat({
+      responseSchemaName,
+      responseSchema,
+      jsonModeOnly: typeof jsonModeOnly === "boolean" ? jsonModeOnly : process.env.OPENROUTER_JSON_MODE === "1"
+    }),
+    temperature,
+    reasoning: {
+      effort: OPENROUTER_REASONING,
+      exclude: true
+    }
+  };
+  if (Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
+  return body;
+}
+
+function llmHeaders(config) {
+  const headers = {
+    "content-type": "application/json",
+    "authorization": `Bearer ${config.apiKey}`
+  };
+  if (config.provider === "openrouter") {
+    headers["HTTP-Referer"] = process.env.OPENROUTER_HTTP_REFERER || "http://localhost";
+    headers["X-OpenRouter-Title"] = process.env.OPENROUTER_APP_TITLE || "Influence Map";
+  }
+  return headers;
+}
+
+function acquireLlmSlot() {
+  const started = process.hrtime.bigint();
+  if (activeLlmRequests < LLM_MAX_CONCURRENCY) {
+    activeLlmRequests += 1;
+    return Promise.resolve({ queueMs: elapsedMs(started) });
+  }
+  return new Promise(resolve => {
+    queuedLlmRequests.push(() => {
+      activeLlmRequests += 1;
+      resolve({ queueMs: elapsedMs(started) });
+    });
+  });
+}
+
+function releaseLlmSlot() {
+  activeLlmRequests = Math.max(0, activeLlmRequests - 1);
+  const next = queuedLlmRequests.shift();
+  if (next) next();
+}
+
+async function callChatCompletion(config, prompt, options) {
+  const slot = await acquireLlmSlot();
+  const started = process.hrtime.bigint();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LLM_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${config.baseUrl}${config.endpoint}`, {
+      method: "POST",
+      headers: llmHeaders(config),
+      signal: controller.signal,
+      body: JSON.stringify(llmRequestBody(config, {
+        messages: prompt.messages,
+        temperature: options.temperature,
+        maxTokens: options.maxTokens,
+        responseSchemaName: options.responseSchemaName,
+        responseSchema: options.responseSchema,
+        jsonModeOnly: options.jsonModeOnly
+      }))
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`${config.provider} ${response.status}: ${text.slice(0, 500)}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    return {
+      data,
+      content,
+      usage: usageSummary(data),
+      finishReason: data.choices && data.choices[0] && data.choices[0].finish_reason,
+      ms: elapsedMs(started),
+      queueMs: slot.queueMs,
+      id: data.id || ""
+    };
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      throw new Error(`${config.provider} request timed out after ${Math.round(LLM_REQUEST_TIMEOUT_MS / 1000)}s`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    releaseLlmSlot();
+  }
+}
+
+function usageSummary(data) {
+  const usage = data && data.usage ? data.usage : {};
+  const details = usage.completion_tokens_details || {};
+  return {
+    promptTokens: usage.prompt_tokens || 0,
+    completionTokens: usage.completion_tokens || 0,
+    totalTokens: usage.total_tokens || 0,
+    reasoningTokens: details.reasoning_tokens || 0
+  };
 }
 
 function normalizeName(name) {
@@ -209,6 +472,59 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function elapsedMs(start) {
+  return Math.round(Number(process.hrtime.bigint() - start) / 1_000_000);
+}
+
+function configuredMaxTokens() {
+  return LLM_MAX_TOKENS > 0 ? LLM_MAX_TOKENS : undefined;
+}
+
+function recordProfile(event) {
+  const profile = {
+    ...event,
+    at: nowIso()
+  };
+  profileEvents.unshift(profile);
+  profileEvents.length = Math.min(profileEvents.length, 80);
+  try {
+    const timings = Array.isArray(profile.timings) ? profile.timings : [];
+    const total = timings.find(item => item && item.stage === "total");
+    const usage = profile.usage && profile.usage.expansion ? profile.usage.expansion : {};
+    const llm = profile.llm || {};
+    db.prepare(`
+      INSERT INTO llm_profiles (
+        event_type, provider, model, entity, status, total_ms, request_ms, queue_ms,
+        prompt_tokens, completion_tokens, reasoning_tokens, error, event_json, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalizeName(profile.type || "event"),
+      normalizeName(profile.provider || ""),
+      normalizeName(profile.model || ""),
+      normalizeName(profile.entity || ""),
+      profile.error ? "error" : "ok",
+      Number(total && total.ms) || 0,
+      Number(llm.expansionRequestMs || llm.identityRequestMs) || null,
+      Number(llm.expansionQueueMs || llm.identityQueueMs) || null,
+      Number(usage.promptTokens) || null,
+      Number(usage.completionTokens) || null,
+      Number(usage.reasoningTokens) || null,
+      normalizeName(profile.error || ""),
+      JSON.stringify(profile),
+      profile.at
+    );
+    db.prepare(`
+      DELETE FROM llm_profiles
+      WHERE id NOT IN (
+        SELECT id FROM llm_profiles ORDER BY id DESC LIMIT 300
+      )
+    `).run();
+  } catch (error) {
+    console.warn(`Could not persist profile: ${error.message}`);
+  }
+}
+
 function parseJson(value, fallback) {
   try {
     return value ? JSON.parse(value) : fallback;
@@ -282,6 +598,25 @@ function initDb() {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS llm_profiles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      provider TEXT NOT NULL DEFAULT '',
+      model TEXT NOT NULL DEFAULT '',
+      entity TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'ok',
+      total_ms INTEGER NOT NULL DEFAULT 0,
+      request_ms INTEGER,
+      queue_ms INTEGER,
+      prompt_tokens INTEGER,
+      completion_tokens INTEGER,
+      reasoning_tokens INTEGER,
+      error TEXT NOT NULL DEFAULT '',
+      event_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_llm_profiles_created_at ON llm_profiles(created_at);
+    CREATE INDEX IF NOT EXISTS idx_llm_profiles_status ON llm_profiles(status);
   `);
   const suggestionColumns = db.prepare("PRAGMA table_info(dedupe_suggestions)").all().map(row => row.name);
   if (!suggestionColumns.includes("action")) {
@@ -303,6 +638,70 @@ function setSetting(key, value) {
     VALUES (?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value
   `).run(key, String(value));
+}
+
+function rowToProfile(row) {
+  const parsed = parseJson(row.event_json, {});
+  return {
+    ...parsed,
+    profileId: row.id,
+    at: parsed.at || row.created_at
+  };
+}
+
+function recentProfiles(limit = 40) {
+  return db.prepare(`
+    SELECT * FROM llm_profiles
+    ORDER BY id DESC
+    LIMIT ?
+  `).all(Math.max(1, Math.min(100, Number(limit) || 40))).map(rowToProfile);
+}
+
+function profileDurationMs(profile) {
+  const total = Array.isArray(profile && profile.timings)
+    ? profile.timings.find(item => item && item.stage === "total")
+    : null;
+  const llm = profile && profile.llm ? profile.llm : {};
+  return Math.max(
+    Number(total && total.ms) || 0,
+    Number(llm.expansionRequestMs || llm.identityRequestMs || 0)
+  );
+}
+
+function diagnosticCounts() {
+  const nodes = db.prepare("SELECT COUNT(*) AS count FROM nodes").get().count;
+  const observations = db.prepare("SELECT COUNT(*) AS count FROM observations").get().count;
+  const pendingIdentity = db.prepare("SELECT COUNT(*) AS count FROM dedupe_suggestions WHERE status = 'pending'").get().count;
+  const profiles = db.prepare("SELECT COUNT(*) AS count FROM llm_profiles").get().count;
+  const errors = db.prepare("SELECT COUNT(*) AS count FROM llm_profiles WHERE status = 'error'").get().count;
+  const slowProfiles = db.prepare("SELECT event_json FROM llm_profiles")
+    .all()
+    .map(row => parseJson(row.event_json, {}))
+    .filter(profile => profileDurationMs(profile) >= 10000)
+    .length;
+  return { nodes, observations, pendingIdentity, profiles, errors, slowProfiles };
+}
+
+function diagnosticSummary() {
+  const config = providerConfig(DEFAULT_LLM_PROVIDER);
+  const recent = recentProfiles(20);
+  return {
+    provider: config.apiKey ? config.provider : "mock",
+    model: config.apiKey ? config.model : "",
+    thinking: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled",
+    openRouterJsonMode: process.env.OPENROUTER_JSON_MODE === "1",
+    llmQueue: {
+      active: activeLlmRequests,
+      queued: queuedLlmRequests.length,
+      concurrency: LLM_MAX_CONCURRENCY,
+      timeoutMs: LLM_REQUEST_TIMEOUT_MS,
+      maxTokens: configuredMaxTokens() || null
+    },
+    counts: diagnosticCounts(),
+    profiles: recent,
+    slowThresholdMs: 10000,
+    generatedAt: nowIso()
+  };
 }
 
 function upsertNode(name, options = {}) {
@@ -494,7 +893,7 @@ function graphFromDb() {
   };
 }
 
-function writeGraphToDb(data) {
+function writeGraphToDb(data, options = {}) {
   const graph = sanitizeGraphData(data);
   const timestamp = nowIso();
   try {
@@ -537,7 +936,7 @@ function writeGraphToDb(data) {
     setSetting("zoom", graph.zoom);
     setSetting("minConfidence", graph.minConfidence);
     db.exec("COMMIT");
-    localIdentityHygiene([...touchedNames]);
+    if (options.runIdentityHygiene) localIdentityHygiene([...touchedNames]);
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
@@ -550,7 +949,7 @@ function migrateJsonToDb() {
   if (hasRows || !fs.existsSync(DATA_FILE)) return;
   const raw = fs.readFileSync(DATA_FILE, "utf8").replace(/^\uFEFF/, "");
   const graph = sanitizeGraphData(JSON.parse(raw));
-  writeGraphToDb(graph);
+  writeGraphToDb(graph, { runIdentityHygiene: true });
   console.log(`Migrated ${graph.nodes.length} nodes and ${graph.observations.length} observations to ${DB_FILE}`);
 }
 
@@ -638,13 +1037,14 @@ function buildInfluenceMessages(entity, context = {}) {
     "Use context only to identify the intended entity sense; do not limit the output to the supplied context.",
     "Treat context as disambiguation metadata, not as evidence that a relationship is true and not as a request to repeat or favor those entities.",
     "Once the entity sense is resolved, reason from general knowledge about that entity, and include only relationships you would still judge significant without seeing the context.",
-    "After resolving the intended entity, include broader significant influences and things influenced by it, including relationships not already present in the context.",
+    "After resolving the intended entity, include a compact useful set of broader significant influences and things influenced by it, including relationships not already present in the context.",
     "Avoid returning only the supplied context relationships unless no other confident relationships are known.",
     "Do not invent, pad, or force relationships just to make the graph grow; empty or small arrays are acceptable when confidence is low.",
     "Confidence is an estimated probability from 0 to 1.",
     "Use any kind of cultural entity: people, works, media, scenes, styles, technologies, or movements.",
     "Do not include explanations, sources, markdown, comments, or extra keys.",
-    "Include as many significant relationships as you can fit confidently, but avoid weak filler."
+    "Return at most 8 influencedBy items and at most 8 influenced items.",
+    "Prefer the strongest relationships over coverage; avoid weak filler."
   ].join(" ");
 
   const user = JSON.stringify({
@@ -736,10 +1136,11 @@ function shouldResolveIdentity(entity, context = {}) {
   const candidates = identityCandidatesFor(entity, clean);
   const bare = !hasDisambiguator(entity) && keyFor(entity).split(/\s+/).length <= 3;
   const hasContext = clean.connectedTo.length || clean.discoveredFrom.length;
-  const hasCompetingCandidates = candidates.filter(candidate => keyFor(candidate.name) !== keyFor(entity)).length > 0;
+  const strongCandidates = candidates.filter(candidate => keyFor(candidate.name) !== keyFor(entity) && candidate.score >= 0.82);
+  const hasContextOverlap = candidates.some(candidate => keyFor(candidate.name) !== keyFor(entity) && candidate.contextOverlap.length);
   return {
     candidates,
-    shouldResolve: Boolean(candidates.length && (hasCompetingCandidates || (bare && hasContext)))
+    shouldResolve: Boolean(strongCandidates.length || (bare && hasContext && hasContextOverlap))
   };
 }
 
@@ -790,34 +1191,22 @@ function sanitizeIdentityResponse(entity, data) {
   };
 }
 
-async function callIdentityResolution(entity, context = {}) {
+async function callIdentityResolution(entity, context = {}, config = providerConfig()) {
   const prompt = buildIdentityMessages(entity, context);
-  const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "authorization": `Bearer ${DEEPSEEK_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      messages: prompt.messages,
-      response_format: { type: "json_object" },
-      temperature: 0.1,
-      max_tokens: 600
-    })
+  const result = await callChatCompletion(config, prompt, {
+    temperature: 0.1,
+    maxTokens: configuredMaxTokens(),
+    responseSchemaName: "identity_resolution",
+    responseSchema: identityResponseSchema
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`DeepSeek identity ${response.status}: ${text.slice(0, 500)}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  if (!content) throw new Error("DeepSeek returned empty identity content");
+  if (!result.content) throw new Error(`${config.provider} returned empty identity content`);
   return {
-    data: sanitizeIdentityResponse(entity, JSON.parse(content)),
-    prompt
+    data: sanitizeIdentityResponse(entity, JSON.parse(result.content)),
+    prompt,
+    usage: result.usage,
+    finishReason: result.finishReason,
+    requestMs: result.ms,
+    queueMs: result.queueMs
   };
 }
 
@@ -846,34 +1235,22 @@ function buildPromptBundle(stages) {
   };
 }
 
-async function callDeepSeek(entity, context = {}) {
+async function callDeepSeek(entity, context = {}, config = providerConfig()) {
   const prompt = buildInfluenceMessages(entity, context);
-  const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "authorization": `Bearer ${DEEPSEEK_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      messages: prompt.messages,
-      response_format: { type: "json_object" },
-      temperature: 0.7,
-      max_tokens: 1800
-    })
+  const result = await callChatCompletion(config, prompt, {
+    temperature: 0.55,
+    maxTokens: configuredMaxTokens(),
+    responseSchemaName: "influence_expansion",
+    responseSchema: influenceResponseSchema
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`DeepSeek ${response.status}: ${text.slice(0, 500)}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  if (!content) throw new Error("DeepSeek returned empty content");
+  if (!result.content) throw new Error(`${config.provider} returned empty content`);
   return {
-    data: sanitizeInfluenceResponse(entity, JSON.parse(content)),
-    prompt
+    data: sanitizeInfluenceResponse(entity, JSON.parse(result.content)),
+    prompt,
+    usage: result.usage,
+    finishReason: result.finishReason,
+    requestMs: result.ms,
+    queueMs: result.queueMs
   };
 }
 
@@ -904,36 +1281,20 @@ function buildDedupeMessages(candidates) {
   };
 }
 
-async function callDedupeReview(candidates) {
+async function callDedupeReview(candidates, config = providerConfig()) {
   const prompt = buildDedupeMessages(candidates);
-  if (!DEEPSEEK_API_KEY || !candidates.length) {
+  if (!config.apiKey || !candidates.length) {
     return { groups: [], prompt };
   }
 
-  const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "authorization": `Bearer ${DEEPSEEK_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      messages: prompt.messages,
-      response_format: { type: "json_object" },
-      temperature: 0.1,
-      max_tokens: 1800
-    })
+  const result = await callChatCompletion(config, prompt, {
+    temperature: 0.1,
+    maxTokens: configuredMaxTokens(),
+    responseSchemaName: "dedupe_review",
+    responseSchema: dedupeResponseSchema
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`DeepSeek ${response.status}: ${text.slice(0, 500)}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  if (!content) return { groups: [], prompt };
-  const parsed = JSON.parse(content);
+  if (!result.content) return { groups: [], prompt };
+  const parsed = JSON.parse(result.content);
   return {
     groups: Array.isArray(parsed.groups) ? parsed.groups.map(group => ({
       canonical: normalizeName(group.canonical),
@@ -941,16 +1302,16 @@ async function callDedupeReview(candidates) {
       confidence: clampConfidence(group.confidence),
       reason: normalizeName(group.reason)
     })).filter(group => group.canonical && group.entities.length > 1) : [],
-    prompt
+    prompt,
+    usage: result.usage,
+    finishReason: result.finishReason,
+    requestMs: result.ms,
+    queueMs: result.queueMs
   };
 }
 
 function scopedDedupeCandidates(names = []) {
-  const touched = new Set((names || []).map(keyFor).filter(Boolean));
-  if (!touched.size) return [];
-  return dedupeCandidatesFromDb(5000)
-    .filter(candidate => (candidate.entities || []).some(name => touched.has(keyFor(name))))
-    .slice(0, 12);
+  return targetedDedupeCandidates(names).slice(0, 12);
 }
 
 function buildScopedIdentityMessages(names, candidates) {
@@ -996,39 +1357,27 @@ function sanitizeScopedIdentityGroups(groups) {
     .filter(group => group.canonical && group.entities.length > 1 && group.confidence >= 0.6);
 }
 
-async function callScopedIdentityReview(names, candidates) {
+async function callScopedIdentityReview(names, candidates, config = providerConfig()) {
   const prompt = buildScopedIdentityMessages(names, candidates);
-  if (!DEEPSEEK_API_KEY || !candidates.length) {
+  if (!config.apiKey || !candidates.length) {
     return { groups: [], prompt };
   }
 
-  const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "authorization": `Bearer ${DEEPSEEK_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: DEEPSEEK_MODEL,
-      messages: prompt.messages,
-      response_format: { type: "json_object" },
-      temperature: 0.1,
-      max_tokens: 900
-    })
+  const result = await callChatCompletion(config, prompt, {
+    temperature: 0.1,
+    maxTokens: configuredMaxTokens(),
+    responseSchemaName: "scoped_identity_review",
+    responseSchema: scopedIdentityResponseSchema
   });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`DeepSeek identity hygiene ${response.status}: ${text.slice(0, 500)}`);
-  }
-
-  const data = await response.json();
-  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-  if (!content) return { groups: [], prompt };
-  const parsed = JSON.parse(content);
+  if (!result.content) return { groups: [], prompt };
+  const parsed = JSON.parse(result.content);
   return {
     groups: sanitizeScopedIdentityGroups(parsed.groups),
-    prompt
+    prompt,
+    usage: result.usage,
+    finishReason: result.finishReason,
+    requestMs: result.ms,
+    queueMs: result.queueMs
   };
 }
 
@@ -1272,17 +1621,126 @@ function targetedTitleVariantCandidates(names = []) {
   return [...groups.values()];
 }
 
+function nodesForIdentityScan() {
+  return db.prepare("SELECT id, name, aliases FROM nodes ORDER BY name COLLATE NOCASE").all()
+    .map(row => {
+      const aliases = parseJson(row.aliases, []);
+      return {
+        id: row.id,
+        name: row.name,
+        aliases,
+        allNames: [row.name, ...aliases].map(normalizeName).filter(Boolean)
+      };
+    });
+}
+
+function targetedDedupeCandidates(names = []) {
+  const inputNames = [...new Set((names || []).map(normalizeName).filter(Boolean))];
+  const touchedKeys = new Set(inputNames.map(keyFor).filter(Boolean));
+  if (!touchedKeys.size) return [];
+
+  const nodes = nodesForIdentityScan();
+  const knownKeys = new Set();
+  for (const node of nodes) {
+    knownKeys.add(node.id);
+    for (const name of node.allNames) knownKeys.add(keyFor(name));
+  }
+  for (const name of inputNames) {
+    const key = keyFor(name);
+    if (!key || knownKeys.has(key)) continue;
+    nodes.push({
+      id: key,
+      name,
+      aliases: [],
+      allNames: [name]
+    });
+    knownKeys.add(key);
+  }
+
+  const touchedNodes = nodes.filter(node => touchedKeys.has(node.id)
+    || node.allNames.some(name => touchedKeys.has(keyFor(name))));
+  if (!touchedNodes.length) return targetedTitleVariantCandidates(names);
+
+  const groups = new Map();
+  function add(reason, items) {
+    const uniqueById = new Map();
+    for (const item of items || []) {
+      if (item && item.id && item.name) uniqueById.set(item.id, item);
+    }
+    const namesForKey = [...uniqueById.values()].map(item => item.name);
+    if (namesForKey.length < 2) return;
+    const key = namesForKey.map(keyFor).sort().join("|");
+    if (!groups.has(key)) groups.set(key, { reason, entities: namesForKey });
+  }
+
+  const seenPairs = new Set();
+  for (const touched of touchedNodes) {
+    for (const node of nodes) {
+      if (touched.id === node.id) continue;
+      const pairKey = [touched.id, node.id].sort().join("|");
+      if (seenPairs.has(pairKey)) continue;
+      seenPairs.add(pairKey);
+
+      const touchedNames = touched.allNames.length ? touched.allNames : [touched.name];
+      const nodeNames = node.allNames.length ? node.allNames : [node.name];
+      const bestNames = [touched.name, node.name];
+
+      if (touched.id.replace(/s$/, "") === node.id.replace(/s$/, "")) {
+        add("same normalized singular form", [touched, node]);
+      }
+
+      if (touched.id.length >= 4 && node.id.length >= 4 && (touched.id.includes(node.id) || node.id.includes(touched.id))) {
+        add("one normalized name contains the other", [touched, node]);
+      }
+
+      for (const touchedName of touchedNames) {
+        for (const nodeName of nodeNames) {
+          const touchedCompact = compactKey(touchedName);
+          const nodeCompact = compactKey(nodeName);
+          if (touchedCompact.length >= 5 && touchedCompact === nodeCompact) {
+            add("same compact punctuation-free form", [touched, node]);
+          }
+          if (isAcronymLike(touchedName) && acronymFor(nodeName) === keyFor(touchedName)) {
+            add("exact acronym-name match", [touched, node]);
+          }
+          if (isAcronymLike(nodeName) && acronymFor(touchedName) === keyFor(nodeName)) {
+            add("exact acronym-name match", [touched, node]);
+          }
+          if (tokenOverlapScore(touchedName, nodeName) >= 0.8) {
+            add("high token overlap", [touched, node]);
+          }
+          if (hasDisambiguator(touchedName)
+            && hasDisambiguator(nodeName)
+            && baseTitleKey(touchedName) === baseTitleKey(nodeName)
+            && compatibleTitleVariants([touchedName, nodeName])) {
+            add("same base title with compatible disambiguators", [touched, node]);
+          }
+          if (hasDisambiguator(touchedName) && baseTitleKey(touchedName) === keyFor(nodeName)) {
+            add("same base title with disambiguator", [touched, node]);
+          }
+          if (hasDisambiguator(nodeName) && baseTitleKey(nodeName) === keyFor(touchedName)) {
+            add("same base title with disambiguator", [touched, node]);
+          }
+        }
+      }
+
+      if (compatibleTitleVariants(bestNames)) {
+        add("same base title with compatible disambiguators", [touched, node]);
+      }
+    }
+  }
+
+  for (const candidate of targetedTitleVariantCandidates(names)) {
+    const key = (candidate.entities || []).map(keyFor).sort().join("|");
+    if (key && !groups.has(key)) groups.set(key, candidate);
+  }
+
+  return [...groups.values()].slice(0, 80);
+}
+
 function localIdentityHygiene(names = []) {
   try {
-    const touched = new Set((names || []).map(keyFor).filter(Boolean));
-    const candidates = dedupeCandidatesFromDb(5000);
-    const scoped = touched.size
-      ? candidates.filter(candidate => (candidate.entities || []).some(name => touched.has(keyFor(name))))
-      : candidates;
-    return storeDedupeSuggestions(localDedupeSuggestions([
-      ...scoped,
-      ...targetedTitleVariantCandidates(names)
-    ]));
+    return storeDedupeSuggestions(localDedupeSuggestions(targetedDedupeCandidates(names)));
   } catch (error) {
     console.warn(`Local identity hygiene skipped: ${error.message}`);
     return 0;
@@ -1439,12 +1897,19 @@ function dedupeCandidatesFromDb(limit = 500) {
 }
 
 async function handleApiInfluences(req, res) {
+  const started = process.hrtime.bigint();
+  const timings = [];
+  let entity = "";
+  let generationEntity = "";
+  let config = providerConfig(DEFAULT_LLM_PROVIDER);
+  let identityResult = null;
   try {
     const raw = await readBody(req);
     const body = raw ? JSON.parse(raw) : {};
-    const entity = normalizeName(body.entity);
+    entity = normalizeName(body.entity);
     const context = sanitizeExpansionContext(body.context);
-    const provider = body.provider || "deepseek";
+    config = providerConfig(body.provider || DEFAULT_LLM_PROVIDER);
+    const provider = config.provider;
     if (!entity) return sendJson(res, 400, { error: "Missing entity" });
 
     if (provider === "mock") {
@@ -1455,52 +1920,133 @@ async function handleApiInfluences(req, res) {
       });
     }
 
-    if (!DEEPSEEK_API_KEY) {
+    if (!config.apiKey) {
       return sendJson(res, 503, {
-        error: "Live generation is not configured. Start the server with DEEPSEEK_API_KEY or use mock mode in dev tools."
+        error: `Live generation is not configured. Start the server with ${provider === "openrouter" ? "OPENROUTER_API_KEY" : "DEEPSEEK_API_KEY"} or use mock mode in dev tools.`
       });
     }
 
     const identityPlan = shouldResolveIdentity(entity, context);
-    let identityResult = null;
-    let generationEntity = entity;
+    generationEntity = entity;
     if (identityPlan.shouldResolve) {
-      identityResult = await callIdentityResolution(entity, context);
+      const stage = process.hrtime.bigint();
+      identityResult = await callIdentityResolution(entity, context, config);
+      timings.push({ stage: "identity", ms: elapsedMs(stage) });
       if (usableIdentityResolution(identityResult.data)) {
         generationEntity = identityResult.data.canonicalName;
       }
     }
 
-    const result = await callDeepSeek(generationEntity, context);
+    const expansionStage = process.hrtime.bigint();
+    const result = await callDeepSeek(generationEntity, context, config);
+    timings.push({ stage: "expansion", ms: elapsedMs(expansionStage) });
     const touchedNames = namesFromInfluenceResponse(entity, result.data);
+    const localStage = process.hrtime.bigint();
     const scopedCandidates = scopedDedupeCandidates(touchedNames);
-    const scopedReview = await callScopedIdentityReview(touchedNames, scopedCandidates);
     const identitySuggestions = storeExpansionIdentitySuggestion(entity, result.data.entity, context);
-    const llmHygieneSuggestions = storeScopedIdentityGroups(scopedReview.groups);
-    const localHygieneSuggestions = localIdentityHygiene(touchedNames);
+    const postExpansionLocalSuggestions = localIdentityHygiene(touchedNames);
+    timings.push({ stage: "local hygiene", ms: elapsedMs(localStage) });
+    const hygieneQueued = scopedCandidates.length > 0;
+    const hygienePrompt = hygieneQueued ? buildScopedIdentityMessages(touchedNames, scopedCandidates) : null;
+    const responseTimings = [
+      ...timings,
+      { stage: "total", ms: elapsedMs(started) }
+    ];
+    recordProfile({
+      type: "expand",
+      entity,
+      generationEntity,
+      provider: config.provider,
+      model: config.model,
+      thinking: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled",
+      identityRan: Boolean(identityResult),
+      hygieneQueued,
+      scopedCandidates: scopedCandidates.length,
+      timings: responseTimings,
+      llm: {
+        identityQueueMs: identityResult && identityResult.queueMs,
+        identityRequestMs: identityResult && identityResult.requestMs,
+        expansionQueueMs: result.queueMs,
+        expansionRequestMs: result.requestMs,
+        concurrency: LLM_MAX_CONCURRENCY,
+        timeoutMs: LLM_REQUEST_TIMEOUT_MS,
+        maxTokens: configuredMaxTokens() || null
+      },
+      usage: {
+        identity: identityResult && identityResult.usage,
+        expansion: result.usage
+      },
+      finishReason: {
+        identity: identityResult && identityResult.finishReason,
+        expansion: result.finishReason
+      }
+    });
     const response = {
-      provider: "deepseek",
-      model: DEEPSEEK_MODEL,
+      provider: config.provider,
+      model: config.model,
       data: result.data,
       identity: identityResult ? identityResult.data : null,
       identityCandidates: identityPlan.candidates,
       scopedIdentityReview: {
         candidates: scopedCandidates.length,
-        groups: scopedReview.groups
+        groups: [],
+        queued: hygieneQueued
       },
       identitySuggestions,
-      llmHygieneSuggestions,
-      localHygieneSuggestions
+      llmHygieneSuggestions: 0,
+      localHygieneSuggestions: postExpansionLocalSuggestions,
+      hygieneQueued,
+      usage: {
+        identity: identityResult && identityResult.usage,
+        expansion: result.usage
+      },
+      llm: {
+        identityQueueMs: identityResult && identityResult.queueMs,
+        identityRequestMs: identityResult && identityResult.requestMs,
+        expansionQueueMs: result.queueMs,
+        expansionRequestMs: result.requestMs,
+        concurrency: LLM_MAX_CONCURRENCY,
+        timeoutMs: LLM_REQUEST_TIMEOUT_MS,
+        maxTokens: configuredMaxTokens() || null
+      },
+      finishReason: {
+        identity: identityResult && identityResult.finishReason,
+        expansion: result.finishReason
+      },
+      timings: responseTimings
     };
     if (hasAdminAccess(req, new URL(req.url, `http://${req.headers.host}`))) {
       response.debugPrompt = buildPromptBundle({
         identity: identityResult && identityResult.prompt,
         expansion: result.prompt,
-        hygiene: scopedReview.prompt
+        hygiene: hygienePrompt
       });
     }
     return sendJson(res, 200, response);
   } catch (error) {
+    recordProfile({
+      type: "expand-error",
+      entity,
+      generationEntity,
+      provider: config.provider,
+      model: config.model,
+      thinking: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled",
+      identityRan: Boolean(identityResult),
+      timings: [
+        ...timings,
+        { stage: "total", ms: elapsedMs(started) }
+      ],
+      llm: {
+        identityQueueMs: identityResult && identityResult.queueMs,
+        identityRequestMs: identityResult && identityResult.requestMs,
+        concurrency: LLM_MAX_CONCURRENCY,
+        active: activeLlmRequests,
+        queued: queuedLlmRequests.length,
+        timeoutMs: LLM_REQUEST_TIMEOUT_MS,
+        maxTokens: configuredMaxTokens() || null
+      },
+      error: error.message || "Influence generation failed"
+    });
     sendJson(res, 500, { error: error.message || "Influence generation failed" });
   }
 }
@@ -1532,12 +2078,12 @@ async function readGraphData() {
 }
 
 async function writeGraphData(data) {
-  return writeGraphToDb(data);
+  return writeGraphToDb(data, { runIdentityHygiene: false });
 }
 
 async function normalizeGraphFile() {
   const graph = graphFromDb();
-  writeGraphToDb(graph);
+  writeGraphToDb(graph, { runIdentityHygiene: true });
   console.log(`Normalized SQLite graph data at ${DB_FILE}`);
 }
 
@@ -1566,8 +2112,9 @@ async function handleApiGraph(req, res) {
 async function handleApiDedupeReview(req, res, url) {
   if (!requireAdmin(req, res, url)) return;
   try {
+    const config = providerConfig(DEFAULT_LLM_PROVIDER);
     const candidates = dedupeCandidatesFromDb();
-    const review = await callDedupeReview(candidates);
+    const review = await callDedupeReview(candidates, config);
     const localGroups = localDedupeSuggestions(candidates);
     const stored = storeDedupeSuggestions([...localGroups, ...review.groups]);
     const response = {
@@ -1576,7 +2123,8 @@ async function handleApiDedupeReview(req, res, url) {
       localGroups,
       stored,
       pending: pendingDedupeSuggestions(),
-      model: DEEPSEEK_API_KEY ? DEEPSEEK_MODEL : "",
+      provider: config.apiKey ? config.provider : "",
+      model: config.apiKey ? config.model : "",
       generatedAt: nowIso()
     };
     if (hasAdminAccess(req, url)) response.debugPrompt = review.prompt;
@@ -1592,6 +2140,110 @@ async function handleApiDedupeSuggestions(req, res, url) {
     sendJson(res, 200, { suggestions: pendingDedupeSuggestions() });
   } catch (error) {
     sendJson(res, 500, { error: error.message || "Could not load dedupe suggestions" });
+  }
+}
+
+async function handleApiProfiles(req, res, url) {
+  if (!requireAdmin(req, res, url)) return;
+  try {
+    sendJson(res, 200, {
+      profiles: recentProfiles(80),
+      llmQueue: {
+        active: activeLlmRequests,
+        queued: queuedLlmRequests.length,
+        concurrency: LLM_MAX_CONCURRENCY,
+        timeoutMs: LLM_REQUEST_TIMEOUT_MS
+      },
+      generatedAt: nowIso()
+    });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message || "Could not load profiles" });
+  }
+}
+
+async function handleApiDiagnostics(req, res, url) {
+  if (!requireAdmin(req, res, url)) return;
+  try {
+    sendJson(res, 200, diagnosticSummary());
+  } catch (error) {
+    sendJson(res, 500, { error: error.message || "Could not load diagnostics" });
+  }
+}
+
+async function handleApiLlmBenchmark(req, res, url) {
+  if (!requireAdmin(req, res, url)) return;
+  try {
+    const config = providerConfig(DEFAULT_LLM_PROVIDER);
+    if (!config.apiKey) return sendJson(res, 503, { error: `No API key configured for ${config.provider}` });
+    const prompt = {
+      messages: [
+        {
+          role: "system",
+          content: "Return strict JSON only matching {\"entity\":\"Name\",\"influencedBy\":[],\"influenced\":[]}."
+        },
+        {
+          role: "user",
+          content: JSON.stringify({ entity: "The Beatles", task: "Return a tiny valid influence response with at most one item per array." })
+        }
+      ]
+    };
+    const modes = [
+      { name: "json_object", jsonModeOnly: true },
+      { name: "json_schema", jsonModeOnly: false }
+    ];
+    const results = [];
+    for (const mode of modes) {
+      const started = process.hrtime.bigint();
+      const result = await callChatCompletion(config, prompt, {
+        temperature: 0.1,
+        maxTokens: configuredMaxTokens(),
+        responseSchemaName: "benchmark_influence",
+        responseSchema: influenceResponseSchema,
+        jsonModeOnly: mode.jsonModeOnly
+      });
+      results.push({
+        mode: mode.name,
+        ms: elapsedMs(started),
+        requestMs: result.ms,
+        queueMs: result.queueMs,
+        usage: result.usage,
+        finishReason: result.finishReason,
+        responseId: result.id
+      });
+      recordProfile({
+        type: `benchmark-${mode.name}`,
+        entity: "Benchmark",
+        provider: config.provider,
+        model: config.model,
+        thinking: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING,
+        timings: [
+          { stage: "request", ms: result.ms },
+          { stage: "total", ms: elapsedMs(started) }
+        ],
+        llm: {
+          expansionQueueMs: result.queueMs,
+          expansionRequestMs: result.ms,
+          concurrency: LLM_MAX_CONCURRENCY,
+          timeoutMs: LLM_REQUEST_TIMEOUT_MS,
+          maxTokens: configuredMaxTokens() || null
+        },
+        usage: {
+          expansion: result.usage
+        },
+        finishReason: {
+          expansion: result.finishReason
+        }
+      });
+    }
+    sendJson(res, 200, {
+      provider: config.provider,
+      model: config.model,
+      reasoning: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING,
+      results,
+      generatedAt: nowIso()
+    });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message || "LLM benchmark failed" });
   }
 }
 
@@ -1699,16 +2351,31 @@ const server = http.createServer((req, res) => {
     handleApiDedupeSuggestions(req, res, url);
     return;
   }
+  if (req.method === "GET" && url.pathname === "/api/profiles") {
+    handleApiProfiles(req, res, url);
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/diagnostics") {
+    handleApiDiagnostics(req, res, url);
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/llm-benchmark") {
+    handleApiLlmBenchmark(req, res, url);
+    return;
+  }
   const decisionMatch = url.pathname.match(/^\/api\/dedupe-suggestions\/(\d+)\/(approve|reject)$/);
   if (req.method === "POST" && decisionMatch) {
     handleApiDedupeDecision(req, res, url, Number(decisionMatch[1]), decisionMatch[2]);
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/config") {
+    const config = providerConfig(DEFAULT_LLM_PROVIDER);
     sendJson(res, 200, {
       devTools: hasAdminAccess(req, url),
       adminRequired: DEV_TOOLS && Boolean(ADMIN_TOKEN),
-      provider: DEEPSEEK_API_KEY ? "deepseek" : "mock"
+      provider: config.apiKey ? config.provider : "mock",
+      model: config.apiKey ? config.model : "",
+      thinking: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled"
     });
     return;
   }
@@ -1721,7 +2388,8 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
+  const config = providerConfig(DEFAULT_LLM_PROVIDER);
   console.log(`Influence graph running at http://localhost:${PORT}`);
-  console.log(DEEPSEEK_API_KEY ? `Using ${DEEPSEEK_MODEL}` : "No DEEPSEEK_API_KEY set; using mock mode");
+  console.log(config.apiKey ? `Using ${config.provider}/${config.model}` : `No API key set for ${config.provider}; using mock mode`);
   normalizeGraphFile();
 });

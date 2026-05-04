@@ -50,10 +50,21 @@
             <div><span>Observations</span><strong id="observation-count">0</strong></div>
             <div><span>Expanded</span><strong id="expanded-count">0</strong></div>
           </div>
+          <div class="panel-overview">
+            <button type="button" id="activity-summary">
+              <span>Now</span>
+              <strong>Idle</strong>
+            </button>
+            <button type="button" id="identity-summary" class="dev-only">
+              <span>Identity</span>
+              <strong>0 pending</strong>
+            </button>
+          </div>
           <div class="panel-tabs" aria-label="Panel sections">
             <button type="button" data-panel-tab="selected" aria-pressed="true">Selected</button>
             <button type="button" data-panel-tab="activity" aria-pressed="false">Activity</button>
             <button type="button" data-panel-tab="dedupe" aria-pressed="false" class="dev-only">Identity</button>
+            <button type="button" data-panel-tab="diagnostics" aria-pressed="false" class="dev-only">Diagnostics</button>
             <button type="button" data-panel-tab="guide" aria-pressed="false">Guide</button>
           </div>
           <section class="panel-page" data-panel-page="selected">
@@ -78,6 +89,14 @@
               <div class="guide-row">
                 <span class="line-swatch"></span>
                 <span>Arrows point from influencer to influenced.</span>
+              </div>
+              <div class="guide-row">
+                <span class="line-swatch incoming"></span>
+                <span>Blue arrows influence the node you hover or select.</span>
+              </div>
+              <div class="guide-row">
+                <span class="line-swatch outgoing"></span>
+                <span>Orange arrows are things influenced by the node you hover or select.</span>
               </div>
               <div class="guide-row">
                 <span class="line-swatch faint"></span>
@@ -116,6 +135,16 @@
                 <button type="button" data-identity-filter="identity" aria-pressed="false">Checks <span>0</span></button>
               </div>
               <div id="dedupe-output" class="dedupe-output">Identity decisions from expansion wait here until a dev approves or rejects them.</div>
+            </div>
+          </section>
+          <section class="panel-page dev-only" data-panel-page="diagnostics" hidden>
+            <h2>Diagnostics</h2>
+            <div class="details diagnostics-panel">
+              <div class="diagnostics-actions">
+                <button id="refresh-diagnostics" type="button">Refresh</button>
+                <button id="run-benchmark" type="button">Run benchmark</button>
+              </div>
+              <div id="diagnostics-output" class="diagnostics-output">Diagnostics load in dev mode.</div>
             </div>
           </section>
         </aside>

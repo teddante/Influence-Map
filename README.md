@@ -33,7 +33,7 @@ npm start
 
 Open http://localhost:3000.
 
-Without `DEEPSEEK_API_KEY`, the app runs in mock mode so the interface is usable immediately.
+Without a configured provider API key, the app runs in mock mode so the interface is usable immediately.
 
 ## DeepSeek Setup
 
@@ -43,11 +43,33 @@ Set these environment variables before starting the server:
 $env:DEEPSEEK_API_KEY="your_key_here"
 $env:DEEPSEEK_MODEL="deepseek-v4-flash"
 $env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
+$env:DEEPSEEK_THINKING="disabled"
 $env:PORT="3000"
 npm start
 ```
 
 The browser never receives the API key. It calls the local server at `/api/influences`, and the server calls DeepSeek.
+For this graph-building workflow, `DEEPSEEK_THINKING` defaults to `disabled` so the small JSON identity and expansion calls stay fast and cheap. Set it to `enabled` only when you intentionally want slower reasoning-mode calls.
+
+## OpenRouter / Gemini Setup
+
+OpenRouter can be used as the server-side provider for Google's Gemini Flash Lite model:
+
+```powershell
+$env:INFLUENCE_MAP_LLM_PROVIDER="openrouter"
+$env:OPENROUTER_API_KEY="your_openrouter_key_here"
+$env:OPENROUTER_MODEL="google/gemini-3.1-flash-lite-preview"
+$env:OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
+$env:OPENROUTER_REASONING="none"
+$env:OPENROUTER_JSON_MODE="1"
+$env:INFLUENCE_MAP_LLM_CONCURRENCY="1"
+$env:INFLUENCE_MAP_LLM_TIMEOUT_MS="45000"
+$env:PORT="3000"
+npm start
+```
+
+The browser still does not receive the API key. `OPENROUTER_REASONING=none` keeps Gemini's thinking mode off for this low-latency JSON workflow. `OPENROUTER_JSON_MODE=1` uses OpenRouter JSON mode, which is faster for this app than strict schema mode while still being parsed and sanitized by the server. Set it to `0` if you want stricter schema enforcement and can accept higher latency.
+By default, the server sends no `max_tokens` cap. Set `INFLUENCE_MAP_LLM_MAX_TOKENS` only if you want to force one. `INFLUENCE_MAP_LLM_CONCURRENCY=1` avoids provider-side queue spikes when several expansions are clicked at once.
 
 ## Persistence
 
@@ -75,9 +97,19 @@ npm start
 
 When `INFLUENCE_MAP_ADMIN_TOKEN` is set, open the app once with `?admin=choose-a-private-token` to unlock dev tools in that browser. The token is stored in local storage and sent as `x-admin-token` for admin-only endpoints.
 
-The UI always requests DeepSeek for generation. Searching for a missing entity requires live generation; if no `DEEPSEEK_API_KEY` is configured, the server returns an error instead of adding generic placeholder relationships.
+The UI uses whichever server-side provider is configured. Searching for a missing entity requires live generation; if the selected provider has no API key configured, the server returns an error instead of adding generic placeholder relationships.
 
-Dev mode includes an LLM-assisted dedupe review. The server first builds cheap local duplicate candidates, then sends only those candidates to DeepSeek for a JSON review. It reports suggested groups but does not merge automatically.
+Dev mode includes an LLM-assisted dedupe review. The server first builds cheap local duplicate candidates, then sends only those candidates to the configured provider for a JSON review. It reports suggested groups but does not merge automatically.
+
+Dev mode also includes a Diagnostics tab. It shows the active provider/model, queue state, database counts, recent successful and failed model calls, token usage, and request timings. Diagnostics are persisted in SQLite in `llm_profiles`, so restarts do not erase the trail. The benchmark button runs a tiny provider check without changing the graph.
+
+For Codex browser automation, this machine can use the bundled Node runtime by setting `NODE_REPL_NODE_PATH` to:
+
+```text
+C:\Users\edwar\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe
+```
+
+Restart the Codex desktop app after setting it so the browser automation plugin can pick it up.
 
 ## Data Shape
 
