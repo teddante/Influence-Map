@@ -1,14 +1,17 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const { DatabaseSync } = require("node:sqlite");
 
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_FILE = process.env.INFLUENCE_MAP_DATA_FILE || path.join(__dirname, "data", "graph.json");
+const DB_FILE = process.env.INFLUENCE_MAP_DB_FILE || path.join(__dirname, "data", "influence-map.sqlite");
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
 const DEV_TOOLS = process.env.INFLUENCE_MAP_DEV_TOOLS === "1";
+const ADMIN_TOKEN = process.env.INFLUENCE_MAP_ADMIN_TOKEN || "";
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -171,6 +174,213 @@ function keyFor(name) {
     .trim();
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function parseJson(value, fallback) {
+  try {
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function adminTokenFrom(req, url) {
+  return req.headers["x-admin-token"] || url.searchParams.get("admin") || "";
+}
+
+function hasAdminAccess(req, url) {
+  if (!ADMIN_TOKEN) return DEV_TOOLS;
+  return DEV_TOOLS && adminTokenFrom(req, url) === ADMIN_TOKEN;
+}
+
+function requireAdmin(req, res, url) {
+  if (hasAdminAccess(req, url)) return true;
+  sendJson(res, 403, { error: "Admin access required" });
+  return false;
+}
+
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+const db = new DatabaseSync(DB_FILE);
+
+function initDb() {
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS nodes (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      aliases TEXT NOT NULL DEFAULT '[]',
+      x REAL NOT NULL DEFAULT 0,
+      y REAL NOT NULL DEFAULT 0,
+      expanded INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS observations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_id TEXT NOT NULL,
+      to_id TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      source_entity TEXT,
+      provider TEXT,
+      model TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_observations_from ON observations(from_id);
+    CREATE INDEX IF NOT EXISTS idx_observations_to ON observations(to_id);
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+  `);
+}
+
+function getSetting(key, fallback) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
+  return row ? row.value : fallback;
+}
+
+function setSetting(key, value) {
+  db.prepare(`
+    INSERT INTO settings (key, value)
+    VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, String(value));
+}
+
+function upsertNode(name, options = {}) {
+  const cleanName = normalizeName(name);
+  const id = keyFor(cleanName);
+  if (!id) return null;
+  const existing = db.prepare("SELECT * FROM nodes WHERE id = ?").get(id);
+  const timestamp = nowIso();
+  if (!existing) {
+    db.prepare(`
+      INSERT INTO nodes (id, name, aliases, x, y, expanded, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      cleanName,
+      JSON.stringify(options.aliases || []),
+      finiteNumber(options.x, 0),
+      finiteNumber(options.y, 0),
+      options.expanded ? 1 : 0,
+      timestamp,
+      timestamp
+    );
+    return id;
+  }
+
+  const aliases = parseJson(existing.aliases, []);
+  for (const alias of [cleanName, ...(options.aliases || [])].map(normalizeName).filter(Boolean)) {
+    if (alias !== existing.name && !aliases.includes(alias)) aliases.push(alias);
+  }
+  db.prepare(`
+    UPDATE nodes
+    SET name = ?,
+        aliases = ?,
+        x = ?,
+        y = ?,
+        expanded = CASE WHEN ? THEN 1 ELSE expanded END,
+        updated_at = ?
+    WHERE id = ?
+  `).run(
+    existing.name || cleanName,
+    JSON.stringify(aliases.slice(0, 20)),
+    Number.isFinite(Number(options.x)) ? Number(options.x) : existing.x,
+    Number.isFinite(Number(options.y)) ? Number(options.y) : existing.y,
+    options.expanded ? 1 : 0,
+    timestamp,
+    id
+  );
+  return id;
+}
+
+function graphFromDb() {
+  const nodes = db.prepare("SELECT * FROM nodes ORDER BY name COLLATE NOCASE").all().map(row => ({
+    id: row.id,
+    name: row.name,
+    aliases: parseJson(row.aliases, []),
+    x: row.x,
+    y: row.y
+  }));
+  const nameById = new Map(nodes.map(node => [node.id, node.name]));
+  const observations = db.prepare("SELECT * FROM observations ORDER BY id").all().map(row => ({
+    id: row.id,
+    from: nameById.get(row.from_id) || row.from_id,
+    to: nameById.get(row.to_id) || row.to_id,
+    confidence: row.confidence,
+    sourceEntity: row.source_entity || "",
+    provider: row.provider || "",
+    model: row.model || "",
+    createdAt: row.created_at
+  }));
+  return {
+    version: 2,
+    savedAt: getSetting("savedAt", nowIso()),
+    nodes,
+    observations,
+    expanded: db.prepare("SELECT id FROM nodes WHERE expanded = 1 ORDER BY name COLLATE NOCASE").all().map(row => row.id),
+    pan: parseJson(getSetting("pan", ""), { x: 0, y: 0 }),
+    zoom: Number(getSetting("zoom", "1")) || 1,
+    minConfidence: Number(getSetting("minConfidence", "0.35")) || 0.35
+  };
+}
+
+function writeGraphToDb(data) {
+  const graph = sanitizeGraphData(data);
+  const timestamp = nowIso();
+  try {
+    db.exec("BEGIN");
+    db.exec("DELETE FROM observations; DELETE FROM nodes;");
+    for (const node of graph.nodes) {
+      upsertNode(node.name, {
+        aliases: node.aliases,
+        x: node.x,
+        y: node.y,
+        expanded: graph.expanded.includes(node.id)
+      });
+    }
+    const insertObservation = db.prepare(`
+      INSERT INTO observations (from_id, to_id, confidence, source_entity, provider, model, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const observation of Array.isArray(data && data.observations) ? data.observations : graph.observations) {
+      const fromId = upsertNode(observation.from);
+      const toId = upsertNode(observation.to);
+      if (!fromId || !toId || fromId === toId) continue;
+      insertObservation.run(
+        fromId,
+        toId,
+        Number(clampConfidence(observation.confidence).toFixed(3)),
+        normalizeName(observation.sourceEntity || ""),
+        normalizeName(observation.provider || ""),
+        normalizeName(observation.model || ""),
+        normalizeName(observation.createdAt || "") || timestamp
+      );
+    }
+    setSetting("savedAt", timestamp);
+    setSetting("pan", JSON.stringify(graph.pan));
+    setSetting("zoom", graph.zoom);
+    setSetting("minConfidence", graph.minConfidence);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return graphFromDb();
+}
+
+function migrateJsonToDb() {
+  const hasRows = db.prepare("SELECT COUNT(*) AS count FROM nodes").get().count > 0;
+  if (hasRows || !fs.existsSync(DATA_FILE)) return;
+  const raw = fs.readFileSync(DATA_FILE, "utf8").replace(/^\uFEFF/, "");
+  const graph = sanitizeGraphData(JSON.parse(raw));
+  writeGraphToDb(graph);
+  console.log(`Migrated ${graph.nodes.length} nodes and ${graph.observations.length} observations to ${DB_FILE}`);
+}
+
 function mockInfluences(entity) {
   const seed = normalizeName(entity);
   const library = {
@@ -278,6 +488,100 @@ async function callDeepSeek(entity) {
   return sanitizeInfluenceResponse(entity, JSON.parse(content));
 }
 
+async function callDedupeReview(candidates) {
+  if (!DEEPSEEK_API_KEY || !candidates.length) {
+    return { groups: [] };
+  }
+  const system = [
+    "You review possible duplicate entity names in an influence graph.",
+    "Return strict JSON only matching this shape:",
+    "{\"groups\":[{\"canonical\":\"Name\",\"entities\":[\"Name\"],\"confidence\":0.0,\"reason\":\"short reason\"}]}",
+    "Only group names that refer to the same real entity, work, person, series, or concept.",
+    "Do not merge broad related concepts with specific works.",
+    "Keep reasons short and do not include markdown."
+  ].join(" ");
+
+  const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${DEEPSEEK_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: DEEPSEEK_MODEL,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify({ candidates }).slice(0, 12000) }
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.1,
+      max_tokens: 1800
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`DeepSeek ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  if (!content) return { groups: [] };
+  const parsed = JSON.parse(content);
+  return {
+    groups: Array.isArray(parsed.groups) ? parsed.groups.map(group => ({
+      canonical: normalizeName(group.canonical),
+      entities: Array.isArray(group.entities) ? group.entities.map(normalizeName).filter(Boolean) : [],
+      confidence: clampConfidence(group.confidence),
+      reason: normalizeName(group.reason)
+    })).filter(group => group.canonical && group.entities.length > 1) : []
+  };
+}
+
+function acronymFor(name) {
+  return normalizeName(name)
+    .split(/\s+/)
+    .filter(part => !["the", "a", "an", "of", "and"].includes(part.toLowerCase()))
+    .map(part => part[0])
+    .join("")
+    .toLowerCase();
+}
+
+function dedupeCandidatesFromDb() {
+  const nodes = db.prepare("SELECT id, name, aliases FROM nodes ORDER BY name COLLATE NOCASE").all()
+    .map(row => ({ id: row.id, name: row.name, aliases: parseJson(row.aliases, []) }));
+  const groups = new Map();
+
+  function add(reason, items) {
+    const names = [...new Set(items.map(item => item.name).filter(Boolean))];
+    if (names.length < 2) return;
+    const key = names.map(keyFor).sort().join("|");
+    if (!groups.has(key)) groups.set(key, { reason, entities: names });
+  }
+
+  const byNoPlural = new Map();
+  for (const node of nodes) {
+    const singular = node.id.replace(/s$/, "");
+    const bucket = byNoPlural.get(singular) || [];
+    bucket.push(node);
+    byNoPlural.set(singular, bucket);
+  }
+  for (const bucket of byNoPlural.values()) add("same normalized singular form", bucket);
+
+  for (let i = 0; i < nodes.length; i += 1) {
+    for (let j = i + 1; j < nodes.length; j += 1) {
+      const a = nodes[i];
+      const b = nodes[j];
+      if (a.id.length < 4 || b.id.length < 4) continue;
+      if (a.id.includes(b.id) || b.id.includes(a.id)) add("one normalized name contains the other", [a, b]);
+      if (acronymFor(a.name) && acronymFor(a.name) === b.id) add("acronym match", [a, b]);
+      if (acronymFor(b.name) && acronymFor(b.name) === a.id) add("acronym match", [a, b]);
+    }
+  }
+
+  return [...groups.values()].slice(0, 40);
+}
+
 async function handleApiInfluences(req, res) {
   try {
     const raw = await readBody(req);
@@ -312,37 +616,17 @@ async function handleApiInfluences(req, res) {
 }
 
 async function readGraphData() {
-  try {
-    const raw = await fs.promises.readFile(DATA_FILE, "utf8");
-    return sanitizeGraphData(JSON.parse(raw));
-  } catch (error) {
-    if (error.code === "ENOENT") return sanitizeGraphData({});
-    throw error;
-  }
+  return graphFromDb();
 }
 
 async function writeGraphData(data) {
-  const graph = sanitizeGraphData({
-    ...data,
-    savedAt: new Date().toISOString()
-  });
-  await fs.promises.mkdir(path.dirname(DATA_FILE), { recursive: true });
-  await fs.promises.writeFile(DATA_FILE, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
-  return graph;
+  return writeGraphToDb(data);
 }
 
 async function normalizeGraphFile() {
-  try {
-    const raw = await fs.promises.readFile(DATA_FILE, "utf8");
-    const graph = sanitizeGraphData(JSON.parse(raw));
-    await fs.promises.mkdir(path.dirname(DATA_FILE), { recursive: true });
-    await fs.promises.writeFile(DATA_FILE, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
-    console.log(`Normalized graph data at ${DATA_FILE}`);
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      console.warn(`Could not normalize graph data: ${error.message}`);
-    }
-  }
+  const graph = graphFromDb();
+  writeGraphToDb(graph);
+  console.log(`Normalized SQLite graph data at ${DB_FILE}`);
 }
 
 async function handleApiGraph(req, res) {
@@ -364,6 +648,22 @@ async function handleApiGraph(req, res) {
     return sendJson(res, 405, { error: "Method not allowed" });
   } catch (error) {
     sendJson(res, 500, { error: error.message || "Graph persistence failed" });
+  }
+}
+
+async function handleApiDedupeReview(req, res, url) {
+  if (!requireAdmin(req, res, url)) return;
+  try {
+    const candidates = dedupeCandidatesFromDb();
+    const review = await callDedupeReview(candidates);
+    sendJson(res, 200, {
+      candidates,
+      review,
+      model: DEEPSEEK_API_KEY ? DEEPSEEK_MODEL : "",
+      generatedAt: nowIso()
+    });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message || "Dedupe review failed" });
   }
 }
 
@@ -393,6 +693,9 @@ function serveStatic(req, res) {
   });
 }
 
+initDb();
+migrateJsonToDb();
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === "POST" && url.pathname === "/api/influences") {
@@ -403,9 +706,14 @@ const server = http.createServer((req, res) => {
     handleApiGraph(req, res);
     return;
   }
+  if (req.method === "POST" && url.pathname === "/api/dedupe-review") {
+    handleApiDedupeReview(req, res, url);
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/config") {
     sendJson(res, 200, {
-      devTools: DEV_TOOLS,
+      devTools: hasAdminAccess(req, url),
+      adminRequired: DEV_TOOLS && Boolean(ADMIN_TOKEN),
       provider: DEEPSEEK_API_KEY ? "deepseek" : "mock"
     });
     return;

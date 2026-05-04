@@ -8,6 +8,7 @@ const state = {
   expanded: new Set(),
   selected: null,
   devTools: false,
+  expanding: new Set(),
   dragging: null,
   pan: { x: 0, y: 0 },
   zoom: 1,
@@ -33,8 +34,24 @@ const els = {
   edgeCount: document.querySelector("#edge-count"),
   observationCount: document.querySelector("#observation-count"),
   expandedCount: document.querySelector("#expanded-count"),
-  selectedDetails: document.querySelector("#selected-details")
+  selectedDetails: document.querySelector("#selected-details"),
+  dedupeReview: document.querySelector("#dedupe-review"),
+  dedupeOutput: document.querySelector("#dedupe-output")
 };
+
+const MIN_ZOOM = 0.04;
+const MAX_ZOOM = 8;
+
+const adminParam = new URLSearchParams(window.location.search).get("admin");
+if (adminParam) {
+  window.localStorage.setItem("influenceMapAdminToken", adminParam);
+  window.history.replaceState({}, "", window.location.pathname);
+}
+
+function adminHeaders() {
+  const token = window.localStorage.getItem("influenceMapAdminToken");
+  return token ? { "x-admin-token": token } : {};
+}
 
 function displayName(name) {
   return String(name || "").trim().replace(/\s+/g, " ");
@@ -83,14 +100,18 @@ function ensureNode(name) {
   return state.nodes.get(id);
 }
 
-function addObservation(from, to, confidence) {
+function addObservation(from, to, confidence, meta = {}) {
   const source = ensureNode(from);
   const target = ensureNode(to);
   if (!source || !target || source.id === target.id) return;
   state.observations.push({
     from: source.name,
     to: target.name,
-    confidence: Math.max(0, Math.min(1, Number(confidence) || 0.5))
+    confidence: Math.max(0, Math.min(1, Number(confidence) || 0.5)),
+    sourceEntity: displayName(meta.sourceEntity || ""),
+    provider: displayName(meta.provider || ""),
+    model: displayName(meta.model || ""),
+    createdAt: meta.createdAt || new Date().toISOString()
   });
   recomputeEdges();
 }
@@ -125,10 +146,12 @@ function recomputeEdges() {
       from: ensureNode(obs.from),
       to: ensureNode(obs.to),
       sum: 0,
-      count: 0
+      count: 0,
+      observations: []
     };
     current.sum += obs.confidence;
     current.count += 1;
+    current.observations.push(obs);
     grouped.set(key, current);
   }
   state.edges = new Map(
@@ -138,7 +161,8 @@ function recomputeEdges() {
         from: edge.from,
         to: edge.to,
         confidence: edge.sum / edge.count,
-        count: edge.count
+        count: edge.count,
+        observations: edge.observations
       }
     ])
   );
@@ -157,11 +181,15 @@ function popularityPercent(node) {
   return Math.round((Math.max(0, node.weightedPopularity || 0) / maxPopularity) * 100);
 }
 
+function clampZoom(zoom) {
+  return Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+}
+
 function focusNode(node, targetZoom) {
   if (!node) return false;
   const rect = canvas.getBoundingClientRect();
   const nextZoom = Math.max(state.zoom, targetZoom || 1);
-  state.zoom = Math.min(3, Math.max(0.25, nextZoom));
+  state.zoom = clampZoom(nextZoom);
   state.pan = {
     x: rect.width / 2 - node.x * state.zoom,
     y: rect.height / 2 - node.y * state.zoom
@@ -232,7 +260,7 @@ function hydrateGraph(graph) {
     x: Number(graph && graph.pan && graph.pan.x) || 0,
     y: Number(graph && graph.pan && graph.pan.y) || 0
   };
-  state.zoom = Number.isFinite(zoom) ? Math.max(0.25, Math.min(3, zoom)) : 1;
+  state.zoom = Number.isFinite(zoom) ? clampZoom(zoom) : 1;
   state.minConfidence = Number.isFinite(minConfidence) ? Math.max(0, Math.min(1, minConfidence)) : 0.35;
   els.minConfidence.value = state.minConfidence;
 
@@ -257,7 +285,11 @@ function hydrateGraph(graph) {
     state.observations.push({
       from,
       to,
-      confidence: Math.max(0, Math.min(1, Number(observation.confidence) || 0.5))
+      confidence: Math.max(0, Math.min(1, Number(observation.confidence) || 0.5)),
+      sourceEntity: displayName(observation.sourceEntity || ""),
+      provider: displayName(observation.provider || ""),
+      model: displayName(observation.model || ""),
+      createdAt: observation.createdAt || ""
     });
   }
 
@@ -287,7 +319,7 @@ async function loadGraph() {
 
 async function loadConfig() {
   try {
-    const response = await fetch("/api/config");
+    const response = await fetch("/api/config", { headers: adminHeaders() });
     const config = await response.json();
     state.devTools = Boolean(config.devTools);
     document.body.classList.toggle("dev-tools", state.devTools);
@@ -334,22 +366,39 @@ async function fetchInfluences(entity) {
 async function expandEntity(entity) {
   const node = ensureNode(entity);
   if (!node) return;
+  if (state.expanding.has(node.id)) return;
+  state.expanding.add(node.id);
+  state.selected = { type: "node", id: node.id };
   setStatus(`Expanding ${node.name}...`);
-  const payload = await fetchInfluences(node.name);
-  const data = payload.data;
-
-  for (const item of data.influencedBy || []) {
-    addObservation(item.entity, data.entity, item.confidence);
-  }
-  for (const item of data.influenced || []) {
-    addObservation(data.entity, item.entity, item.confidence);
-  }
-
-  state.expanded.add(keyFor(data.entity));
-  setStatus(`Expanded ${data.entity} using ${payload.provider}/${payload.model}.`);
-  scheduleSave();
-  window.setTimeout(scheduleSave, 2500);
   updateUi();
+  try {
+    const payload = await fetchInfluences(node.name);
+    const data = payload.data;
+
+    for (const item of data.influencedBy || []) {
+      addObservation(item.entity, data.entity, item.confidence, {
+        sourceEntity: data.entity,
+        provider: payload.provider,
+        model: payload.model
+      });
+    }
+    for (const item of data.influenced || []) {
+      addObservation(data.entity, item.entity, item.confidence, {
+        sourceEntity: data.entity,
+        provider: payload.provider,
+        model: payload.model
+      });
+    }
+
+    const wasExpanded = state.expanded.has(keyFor(data.entity));
+    state.expanded.add(keyFor(data.entity));
+    setStatus(`${wasExpanded ? "Sampled" : "Expanded"} ${data.entity} using ${payload.provider}/${payload.model}.`);
+    scheduleSave();
+    window.setTimeout(scheduleSave, 2500);
+  } finally {
+    state.expanding.delete(node.id);
+    updateUi();
+  }
 }
 
 async function searchEntity(entity) {
@@ -484,11 +533,20 @@ function draw() {
 
   for (const node of state.nodes.values()) {
     const expanded = state.expanded.has(node.id);
+    const expanding = state.expanding.has(node.id);
     const selected = state.selected && state.selected.type === "node" && state.selected.id === node.id;
     const radius = nodeRadius(node);
+    if (expanding) {
+      const pulse = 5 + Math.sin(Date.now() / 180) * 3;
+      ctx.strokeStyle = "rgba(180, 71, 47, 0.42)";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, radius + 9 + pulse, 0, Math.PI * 2);
+      ctx.stroke();
+    }
     ctx.fillStyle = expanded ? "#35a186" : "#f0b84d";
-    ctx.strokeStyle = selected ? "#b4472f" : "#1f2326";
-    ctx.lineWidth = selected ? 4 : 1.5;
+    ctx.strokeStyle = expanding || selected ? "#b4472f" : "#1f2326";
+    ctx.lineWidth = expanding || selected ? 4 : 1.5;
     ctx.beginPath();
     ctx.arc(node.x, node.y, selected ? radius + 3 : radius, 0, Math.PI * 2);
     ctx.fill();
@@ -549,8 +607,13 @@ function updateSelectedDetails() {
     const incoming = [...state.edges.values()].filter(edge => edge.to.id === node.id).length;
     const outgoing = [...state.edges.values()].filter(edge => edge.from.id === node.id).length;
     const aliases = node.aliases && node.aliases.length ? `<br>Aliases: ${node.aliases.slice(0, 4).join(", ")}` : "";
-    const action = state.expanded.has(node.id) ? "" : `<br><button id="expand-selected" type="button">Expand this entity</button>`;
-    els.selectedDetails.innerHTML = `<strong>${node.name}</strong><br>Incoming: ${incoming}<br>Outgoing: ${outgoing}<br>Popularity: ${Number(node.weightedPopularity || 0).toFixed(2)} weighted observations<br>Relative size: ${popularityPercent(node)}% of current max${aliases}<br>${state.expanded.has(node.id) ? "Expanded" : "Not expanded yet"}${action}`;
+    const isExpanding = state.expanding.has(node.id);
+    const isExpanded = state.expanded.has(node.id);
+    const stateLabel = isExpanding ? "Expanding now..." : isExpanded ? "Expanded" : "Not expanded yet";
+    const actionLabel = isExpanding ? "Expanding..." : isExpanded ? "Sample again" : "Expand this entity";
+    const actionHint = isExpanded && !isExpanding ? "<br><span>Runs another model pass and adds new observations without deleting existing ones.</span>" : "";
+    const action = `<br><button id="expand-selected" type="button" ${isExpanding ? "disabled" : ""}>${actionLabel}</button>${actionHint}`;
+    els.selectedDetails.innerHTML = `<strong>${node.name}</strong><br>Incoming: ${incoming}<br>Outgoing: ${outgoing}<br>Popularity: ${Number(node.weightedPopularity || 0).toFixed(2)} weighted observations<br>Relative size: ${popularityPercent(node)}% of current max${aliases}<br>${stateLabel}${action}`;
     const button = document.querySelector("#expand-selected");
     if (button) {
       button.addEventListener("click", () => expandEntity(node.name).catch(error => setStatus(error.message)));
@@ -558,7 +621,13 @@ function updateSelectedDetails() {
     return;
   }
   const edge = state.edges.get(state.selected.key);
-  els.selectedDetails.innerHTML = `<strong>${edge.from.name} -> ${edge.to.name}</strong><br>Average confidence: ${edge.confidence.toFixed(3)}<br>Observations: ${edge.count}`;
+  const rows = (edge.observations || []).slice(-8).reverse().map(obs => {
+    const when = obs.createdAt ? new Date(obs.createdAt).toLocaleString() : "unknown time";
+    const source = obs.sourceEntity ? ` from ${obs.sourceEntity}` : "";
+    const model = obs.model ? ` via ${obs.model}` : "";
+    return `<li>${Number(obs.confidence).toFixed(3)}${source}${model}<br><span>${when}</span></li>`;
+  }).join("");
+  els.selectedDetails.innerHTML = `<strong>${edge.from.name} -> ${edge.to.name}</strong><br>Average confidence: ${edge.confidence.toFixed(3)}<br>Observations: ${edge.count}<ul class="observation-list">${rows}</ul>`;
 }
 
 function updateUi() {
@@ -623,7 +692,7 @@ canvas.addEventListener("wheel", event => {
     y: (mouseY - state.pan.y) / state.zoom
   };
   const factor = Math.exp(-event.deltaY * 0.0012);
-  state.zoom = Math.max(0.25, Math.min(3, state.zoom * factor));
+  state.zoom = clampZoom(state.zoom * factor);
   state.pan = {
     x: mouseX - before.x * state.zoom,
     y: mouseY - before.y * state.zoom
@@ -652,6 +721,28 @@ els.focusEntity.addEventListener("click", () => {
 
 els.autoExpand.addEventListener("click", () => {
   autoExpandFrontier().catch(error => setStatus(error.message));
+});
+
+els.dedupeReview.addEventListener("click", async () => {
+  els.dedupeOutput.textContent = "Reviewing likely duplicates...";
+  try {
+    const response = await fetch("/api/dedupe-review", {
+      method: "POST",
+      headers: adminHeaders()
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Dedupe review failed");
+    const groups = payload.review && payload.review.groups ? payload.review.groups : [];
+    if (!groups.length) {
+      els.dedupeOutput.textContent = `No confident duplicate groups found from ${payload.candidates.length} local candidates.`;
+      return;
+    }
+    els.dedupeOutput.innerHTML = groups.map(group => (
+      `<div class="dedupe-group"><strong>${group.canonical}</strong><br>${group.entities.join(", ")}<br><span>${Math.round(group.confidence * 100)}% - ${group.reason}</span></div>`
+    )).join("");
+  } catch (error) {
+    els.dedupeOutput.textContent = error.message;
+  }
 });
 
 els.reset.addEventListener("click", () => {

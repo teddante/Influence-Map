@@ -119,6 +119,12 @@ button:hover {
   filter: brightness(0.94);
 }
 
+button:disabled {
+  cursor: progress;
+  opacity: 0.72;
+  filter: none;
+}
+
 #reset-graph {
   background: #4d5552;
   border-color: #4d5552;
@@ -228,6 +234,41 @@ h2 {
   margin-top: 9px;
   min-height: 34px;
   width: 100%;
+}
+
+.observation-list {
+  display: grid;
+  gap: 7px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.observation-list li {
+  padding-top: 7px;
+  border-top: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.observation-list span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dedupe-output {
+  display: grid;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.dedupe-group {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.dedupe-group span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .guide {

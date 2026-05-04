@@ -13,6 +13,7 @@ Influence Map is a tiny prototype for exploring cultural influence as a generate
 - Frontier auto-expansion with a call budget
 - Simple LLM cost estimator
 - Server-side graph persistence to a local JSON file
+- SQLite graph storage with JSON migration on first start
 - Existing-node search with graph focus
 - Wheel/trackpad zoom and drag panning
 - Deterministic name dedupe for simple variants
@@ -50,12 +51,13 @@ The browser never receives the API key. It calls the local server at `/api/influ
 
 ## Persistence
 
-The graph is saved automatically by the local server and restored when the app starts. By default, data is written to `./data/graph.json`, which is ignored by git.
+The graph is saved automatically by the local server and restored when the app starts. By default, SQLite data is written to `./data/influence-map.sqlite`, which is ignored by git. If an older `./data/graph.json` exists and the SQLite database is empty, the server migrates it on first start.
 
 To store it somewhere else:
 
 ```powershell
 $env:INFLUENCE_MAP_DATA_FILE="C:\tmp\influence-map.json"
+$env:INFLUENCE_MAP_DB_FILE="C:\tmp\influence-map.sqlite"
 npm start
 ```
 
@@ -67,10 +69,15 @@ Bulk frontier expansion and reset controls are hidden from normal visitors. To e
 
 ```powershell
 $env:INFLUENCE_MAP_DEV_TOOLS="1"
+$env:INFLUENCE_MAP_ADMIN_TOKEN="choose-a-private-token"
 npm start
 ```
 
+When `INFLUENCE_MAP_ADMIN_TOKEN` is set, open the app once with `?admin=choose-a-private-token` to unlock dev tools in that browser. The token is stored in local storage and sent as `x-admin-token` for admin-only endpoints.
+
 The UI always requests DeepSeek for generation. Searching for a missing entity requires live generation; if no `DEEPSEEK_API_KEY` is configured, the server returns an error instead of adding generic placeholder relationships.
+
+Dev mode includes an LLM-assisted dedupe review. The server first builds cheap local duplicate candidates, then sends only those candidates to DeepSeek for a JSON review. It reports suggested groups but does not merge automatically.
 
 ## Data Shape
 
@@ -95,7 +102,7 @@ David Bowie -> Joy Division
 Joy Division -> Interpol
 ```
 
-Repeated observations for the same directed edge are averaged into one visible graph edge.
+Repeated observations for the same directed edge are averaged into one visible graph edge. Observations store confidence, source expansion entity, provider/model, and timestamp so selected edges can show their underlying history.
 
 Entity names are deduped with a cheap deterministic key: case, punctuation, whitespace, leading `the`, and `&`/`and` variants are normalized before nodes and edges are merged. Popularity is the unbounded weighted number of observations connected to that entity, so prominence emerges from repeated graph evidence rather than another LLM field. Circle size is a relative visual scale based on the current graph's most prominent entity, while the raw popularity score keeps growing.
 

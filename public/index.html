@@ -67,13 +67,20 @@
                 Search focuses existing entities. If none is found, the app generates one new neighborhood and connects it to the map.
               </div>
               <div class="guide-note">
-                Drag to pan, scroll to zoom, click nodes or arrows for details. The confidence slider hides weaker visible links without deleting saved observations.
+                Drag to pan, scroll to zoom, click nodes or arrows for details. Expanded entities can be sampled again to add fresh observations without deleting existing ones.
               </div>
             </div>
           </section>
           <section>
             <h2>Selected</h2>
             <div id="selected-details" class="details">Click a node or edge.</div>
+          </section>
+          <section class="dev-only">
+            <h2>Dedupe Review</h2>
+            <div class="details">
+              <button id="dedupe-review" type="button">Review possible duplicates</button>
+              <div id="dedupe-output" class="dedupe-output">Local candidates are reviewed by DeepSeek before you merge anything.</div>
+            </div>
           </section>
         </aside>
       </section>

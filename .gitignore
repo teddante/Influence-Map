@@ -17,6 +17,8 @@ pnpm-debug.log*
 .DS_Store
 Thumbs.db
 data/
+*.sqlite
+*.sqlite-*
 
 # Editor files
 .vscode/
