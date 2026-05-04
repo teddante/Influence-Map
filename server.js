@@ -267,6 +267,8 @@ function initDb() {
       confidence REAL NOT NULL DEFAULT 0,
       reason TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'pending',
+      action TEXT NOT NULL DEFAULT 'merge',
+      metadata TEXT NOT NULL DEFAULT '{}',
       entities_key TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -281,6 +283,13 @@ function initDb() {
       value TEXT NOT NULL
     );
   `);
+  const suggestionColumns = db.prepare("PRAGMA table_info(dedupe_suggestions)").all().map(row => row.name);
+  if (!suggestionColumns.includes("action")) {
+    db.exec("ALTER TABLE dedupe_suggestions ADD COLUMN action TEXT NOT NULL DEFAULT 'merge'");
+  }
+  if (!suggestionColumns.includes("metadata")) {
+    db.exec("ALTER TABLE dedupe_suggestions ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'");
+  }
 }
 
 function getSetting(key, fallback) {
@@ -411,6 +420,30 @@ function mergeNodes(canonical, entities) {
     timestamp,
     canonicalId
   );
+}
+
+function approveSplitSuggestion(suggestion) {
+  const parsed = rowToSuggestion(suggestion);
+  const metadata = parsed.metadata || {};
+  const ids = Array.isArray(metadata.moveObservationIds)
+    ? metadata.moveObservationIds.map(Number).filter(Number.isFinite)
+    : [];
+  if (!ids.length) return 0;
+
+  const canonicalId = upsertNode(parsed.canonical);
+  const sourceId = keyFor(parsed.entities[0]);
+  if (!canonicalId || !sourceId || canonicalId === sourceId) return 0;
+
+  const updateFrom = db.prepare("UPDATE observations SET from_id = ? WHERE id = ? AND from_id = ?");
+  const updateTo = db.prepare("UPDATE observations SET to_id = ? WHERE id = ? AND to_id = ?");
+  let moved = 0;
+  for (const id of ids) {
+    const fromResult = updateFrom.run(canonicalId, id, sourceId);
+    const toResult = updateTo.run(canonicalId, id, sourceId);
+    moved += fromResult.changes + toResult.changes;
+  }
+  db.prepare("DELETE FROM observations WHERE from_id = to_id").run();
+  return moved;
 }
 
 function graphFromDb() {
@@ -577,6 +610,8 @@ function buildInfluenceMessages(entity, context = {}) {
     "Prefer discoveredFrom context over earlier expansion results when the two conflict, because discoveredFrom describes why the node entered the graph.",
     "Do not switch to a broader generic concept just because the bare text is common; keep the specific contextual entity.",
     "Use context only to identify the intended entity sense; do not limit the output to the supplied context.",
+    "Treat context as disambiguation metadata, not as evidence that a relationship is true and not as a request to repeat or favor those entities.",
+    "Once the entity sense is resolved, reason from general knowledge about that entity, and include only relationships you would still judge significant without seeing the context.",
     "After resolving the intended entity, include broader significant influences and things influenced by it, including relationships not already present in the context.",
     "Avoid returning only the supplied context relationships unless no other confident relationships are known.",
     "Do not invent, pad, or force relationships just to make the graph grow; empty or small arrays are acceptable when confidence is low.",
@@ -598,6 +633,189 @@ function buildInfluenceMessages(entity, context = {}) {
       { role: "user", content: user }
     ],
     context: cleanContext
+  };
+}
+
+function topNeighborsForId(id, limit = 8) {
+  const rows = db.prepare(`
+    SELECT other.name, MAX(o.confidence) AS confidence, COUNT(*) AS count
+    FROM (
+      SELECT to_id AS other_id, confidence FROM observations WHERE from_id = ?
+      UNION ALL
+      SELECT from_id AS other_id, confidence FROM observations WHERE to_id = ?
+    ) o
+    JOIN nodes other ON other.id = o.other_id
+    GROUP BY other.id
+    ORDER BY confidence DESC, count DESC, other.name COLLATE NOCASE
+    LIMIT ?
+  `).all(id, id, limit);
+  return rows.map(row => row.name);
+}
+
+function identityCandidatesFor(entity, context = {}) {
+  const query = normalizeName(entity);
+  const queryKey = keyFor(query);
+  if (!queryKey) return [];
+  const nodes = db.prepare("SELECT id, name, aliases, expanded FROM nodes ORDER BY name COLLATE NOCASE").all()
+    .map(row => ({
+      id: row.id,
+      name: row.name,
+      aliases: parseJson(row.aliases, []),
+      expanded: Boolean(row.expanded)
+    }));
+  const scored = new Map();
+
+  function add(node, reason, score) {
+    if (!node || !node.id) return;
+    const current = scored.get(node.id);
+    if (!current || score > current.score) {
+      scored.set(node.id, { node, reason, score });
+    }
+  }
+
+  for (const node of nodes) {
+    const names = [node.name, ...(node.aliases || [])];
+    const keys = names.map(keyFor);
+    if (node.id === queryKey || keys.includes(queryKey)) add(node, "exact name or alias", 1);
+    if (compactKey(node.name) === compactKey(query)) add(node, "same compact form", 0.94);
+    if (baseTitleKey(node.name) && baseTitleKey(node.name) === baseTitleKey(query)) add(node, "same base title", 0.78);
+    if (isAcronymLike(query) && acronymFor(node.name) === queryKey) add(node, "query matches initials", 0.86);
+    if (isAcronymLike(node.name) && acronymFor(query) === node.id) add(node, "candidate matches initials", 0.82);
+    if (node.id.includes(queryKey) || queryKey.includes(node.id)) add(node, "name contains query", 0.7);
+    if (tokenOverlapScore(node.name, query) >= 0.75) add(node, "high token overlap", 0.68);
+  }
+
+  const cleanContext = sanitizeExpansionContext(context);
+  const contextKeys = new Set([
+    ...cleanContext.connectedTo.map(item => keyFor(item.entity)),
+    ...cleanContext.discoveredFrom.map(item => keyFor(item.sourceEntity))
+  ].filter(Boolean));
+
+  return [...scored.values()]
+    .sort((a, b) => b.score - a.score || a.node.name.localeCompare(b.node.name))
+    .slice(0, 8)
+    .map(item => ({
+      name: item.node.name,
+      aliases: item.node.aliases.slice(0, 6),
+      expanded: item.node.expanded,
+      matchReason: item.reason,
+      score: Number(item.score.toFixed(2)),
+      topNeighbors: topNeighborsForId(item.node.id, 8),
+      contextOverlap: topNeighborsForId(item.node.id, 12).filter(name => contextKeys.has(keyFor(name))).slice(0, 5)
+    }));
+}
+
+function shouldResolveIdentity(entity, context = {}) {
+  const clean = sanitizeExpansionContext(context);
+  const candidates = identityCandidatesFor(entity, clean);
+  const bare = !hasDisambiguator(entity) && keyFor(entity).split(/\s+/).length <= 3;
+  const hasContext = clean.connectedTo.length || clean.discoveredFrom.length;
+  const hasCompetingCandidates = candidates.filter(candidate => keyFor(candidate.name) !== keyFor(entity)).length > 0;
+  return {
+    candidates,
+    shouldResolve: Boolean(candidates.length && (hasCompetingCandidates || (bare && hasContext)))
+  };
+}
+
+function buildIdentityMessages(entity, context = {}) {
+  const cleanContext = sanitizeExpansionContext(context);
+  const { candidates } = shouldResolveIdentity(entity, cleanContext);
+  const system = [
+    "You resolve entity identity for an influence graph as strict json.",
+    "Return only this JSON shape:",
+    "{\"canonicalName\":\"Name\",\"displayName\":\"Name\",\"disambiguation\":\"short phrase\",\"aliases\":[\"Name\"],\"decision\":\"same|rename|merge|split|new|uncertain\",\"confidence\":0.0,\"reason\":\"short reason\"}",
+    "Use local candidates and context only to identify what exact entity is intended.",
+    "Do not decide influence relationships here.",
+    "Do not merge series/franchises with individual works, adaptations with sources, sequels with originals, or broad concepts with specific entities.",
+    "When a bare title likely means a specific work, use a concise Wikipedia-style disambiguated canonicalName.",
+    "If unsure, use decision uncertain and keep the most literal canonicalName."
+  ].join(" ");
+  const user = JSON.stringify({
+    entity,
+    localCandidates: candidates,
+    context: cleanContext
+  });
+  return {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    candidates,
+    context: cleanContext
+  };
+}
+
+function sanitizeIdentityResponse(entity, data) {
+  const canonicalName = normalizeName(data && data.canonicalName) || normalizeName(entity);
+  const displayNameValue = normalizeName(data && data.displayName) || canonicalName;
+  const allowed = new Set(["same", "rename", "merge", "split", "new", "uncertain"]);
+  const decision = allowed.has(normalizeName(data && data.decision).toLowerCase())
+    ? normalizeName(data.decision).toLowerCase()
+    : "uncertain";
+  return {
+    canonicalName,
+    displayName: displayNameValue,
+    disambiguation: normalizeName(data && data.disambiguation),
+    aliases: Array.isArray(data && data.aliases) ? data.aliases.map(normalizeName).filter(Boolean).slice(0, 8) : [],
+    decision,
+    confidence: clampConfidence(data && data.confidence),
+    reason: normalizeName(data && data.reason)
+  };
+}
+
+async function callIdentityResolution(entity, context = {}) {
+  const prompt = buildIdentityMessages(entity, context);
+  const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${DEEPSEEK_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: DEEPSEEK_MODEL,
+      messages: prompt.messages,
+      response_format: { type: "json_object" },
+      temperature: 0.1,
+      max_tokens: 600
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`DeepSeek identity ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  if (!content) throw new Error("DeepSeek returned empty identity content");
+  return {
+    data: sanitizeIdentityResponse(entity, JSON.parse(content)),
+    prompt
+  };
+}
+
+function usableIdentityResolution(identity) {
+  if (!identity || !identity.canonicalName) return false;
+  if (identity.decision === "uncertain" || identity.decision === "new") return false;
+  return identity.confidence >= 0.55;
+}
+
+function buildPromptBundle(stages) {
+  const cleanStages = Object.fromEntries(
+    Object.entries(stages || {}).filter(([, prompt]) => prompt && Array.isArray(prompt.messages))
+  );
+  const messages = [];
+  for (const [stage, prompt] of Object.entries(cleanStages)) {
+    for (const message of prompt.messages) {
+      messages.push({
+        ...message,
+        stage
+      });
+    }
+  }
+  return {
+    stages: cleanStages,
+    messages
   };
 }
 
@@ -711,6 +929,8 @@ function rowToSuggestion(row) {
     entities: parseJson(row.entities, []),
     confidence: row.confidence,
     reason: row.reason,
+    action: row.action || "merge",
+    metadata: parseJson(row.metadata, {}),
     status: row.status,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -738,12 +958,14 @@ function storeDedupeSuggestions(groups) {
         entities = ?,
         confidence = ?,
         reason = ?,
+        action = ?,
+        metadata = ?,
         updated_at = ?
     WHERE id = ?
   `);
   const insert = db.prepare(`
-    INSERT INTO dedupe_suggestions (canonical, entities, confidence, reason, status, entities_key, created_at, updated_at)
-    VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+    INSERT INTO dedupe_suggestions (canonical, entities, confidence, reason, action, metadata, status, entities_key, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
   `);
   let stored = 0;
   for (const group of groups || []) {
@@ -754,15 +976,76 @@ function storeDedupeSuggestions(groups) {
     const serialized = JSON.stringify(entities);
     const confidence = Number(clampConfidence(group.confidence).toFixed(3));
     const reason = normalizeName(group.reason);
+    const action = ["merge", "identity", "split", "rename"].includes(group.action) ? group.action : "merge";
+    const metadata = JSON.stringify(group.metadata || {});
     const existing = existingPending.get(key);
     if (existing) {
-      update.run(canonical, serialized, confidence, reason, timestamp, existing.id);
+      update.run(canonical, serialized, confidence, reason, action, metadata, timestamp, existing.id);
     } else {
-      insert.run(canonical, serialized, confidence, reason, key, timestamp, timestamp);
+      insert.run(canonical, serialized, confidence, reason, action, metadata, key, timestamp, timestamp);
     }
     stored += 1;
   }
   return stored;
+}
+
+function splitCandidatesFor(requestedEntity, canonicalEntity, context = {}) {
+  const requestedId = keyFor(requestedEntity);
+  const canonicalId = keyFor(canonicalEntity);
+  if (!requestedId || !canonicalId || requestedId === canonicalId) return [];
+  const cleanContext = sanitizeExpansionContext(context);
+  const contextKeys = new Set();
+  for (const item of cleanContext.discoveredFrom) {
+    if (item.sourceEntity) contextKeys.add(keyFor(item.sourceEntity));
+  }
+  for (const item of cleanContext.connectedTo) {
+    if (item.entity) contextKeys.add(keyFor(item.entity));
+  }
+  if (!contextKeys.size) return [];
+
+  const rows = db.prepare(`
+    SELECT o.id, o.from_id, o.to_id, o.confidence, o.source_entity,
+           nf.name AS from_name, nt.name AS to_name
+    FROM observations o
+    JOIN nodes nf ON nf.id = o.from_id
+    JOIN nodes nt ON nt.id = o.to_id
+    WHERE o.from_id = ? OR o.to_id = ?
+    ORDER BY o.confidence DESC, o.id DESC
+  `).all(requestedId, requestedId);
+
+  return rows
+    .filter(row => {
+      const otherId = row.from_id === requestedId ? row.to_id : row.from_id;
+      return contextKeys.has(otherId) || contextKeys.has(keyFor(row.source_entity || ""));
+    })
+    .map(row => ({
+      id: row.id,
+      from: row.from_name,
+      to: row.to_name,
+      confidence: row.confidence,
+      sourceEntity: row.source_entity || ""
+    }))
+    .slice(0, 24);
+}
+
+function storeExpansionIdentitySuggestion(requestedEntity, canonicalEntity, context = {}) {
+  const requested = normalizeName(requestedEntity);
+  const canonical = normalizeName(canonicalEntity);
+  if (!requested || !canonical || keyFor(requested) === keyFor(canonical)) return 0;
+  const moveCandidates = splitCandidatesFor(requested, canonical, context);
+  return storeDedupeSuggestions([{
+    canonical,
+    entities: [requested, canonical],
+    confidence: moveCandidates.length ? 0.72 : 0.66,
+    action: moveCandidates.length ? "split" : "identity",
+    metadata: {
+      moveObservationIds: moveCandidates.map(item => item.id),
+      moveCandidates
+    },
+    reason: moveCandidates.length
+      ? `Split review: model resolved "${requested}" as "${canonical}" and found ${moveCandidates.length} context-linked observation${moveCandidates.length === 1 ? "" : "s"} that may belong there`
+      : `Expansion identity review: model resolved "${requested}" as "${canonical}"`
+  }]);
 }
 
 function canonicalFromNames(names) {
@@ -778,15 +1061,14 @@ function canonicalFromNames(names) {
 function localDedupeSuggestions(candidates) {
   const trustedReasons = new Set([
     "same compact punctuation-free form",
-    "shared acronym or initials",
-    "same base title with disambiguator"
+    "exact acronym-name match"
   ]);
   return (candidates || [])
     .filter(candidate => trustedReasons.has(candidate.reason))
     .map(candidate => ({
       canonical: canonicalFromNames(candidate.entities || []),
       entities: candidate.entities || [],
-      confidence: candidate.reason === "same base title with disambiguator" ? 0.68 : 0.72,
+      confidence: 0.72,
       reason: `Local heuristic: ${candidate.reason}`
     }))
     .filter(group => group.canonical && group.entities.length > 1);
@@ -799,6 +1081,11 @@ function acronymFor(name) {
     .map(part => part[0])
     .join("")
     .toLowerCase();
+}
+
+function isAcronymLike(name) {
+  const key = keyFor(name);
+  return /^[a-z0-9]{2,8}$/.test(key) && key === compactKey(name);
 }
 
 function compactKey(name) {
@@ -854,7 +1141,6 @@ function dedupeCandidatesFromDb() {
 
   const byNoPlural = new Map();
   const byCompact = new Map();
-  const byAcronym = new Map();
   const byBaseTitle = new Map();
   for (const node of nodes) {
     const singular = node.id.replace(/s$/, "");
@@ -870,13 +1156,6 @@ function dedupeCandidatesFromDb() {
         byCompact.set(compact, compactBucket);
       }
 
-      const acronym = acronymFor(name);
-      if (acronym.length >= 2) {
-        const acronymBucket = byAcronym.get(acronym) || [];
-        acronymBucket.push(node);
-        byAcronym.set(acronym, acronymBucket);
-      }
-
       const baseTitle = baseTitleKey(name);
       if (baseTitle && baseTitle !== keyFor(name) && hasDisambiguator(name)) {
         const baseBucket = byBaseTitle.get(baseTitle) || [];
@@ -887,7 +1166,6 @@ function dedupeCandidatesFromDb() {
   }
   for (const bucket of byNoPlural.values()) add("same normalized singular form", bucket);
   for (const bucket of byCompact.values()) add("same compact punctuation-free form", bucket);
-  for (const bucket of byAcronym.values()) add("shared acronym or initials", bucket);
   for (const [baseTitle, bucket] of byBaseTitle) {
     const exactBase = nodes.find(node => node.id === baseTitle);
     add("same base title with disambiguator", exactBase ? [exactBase, ...bucket] : bucket);
@@ -899,8 +1177,8 @@ function dedupeCandidatesFromDb() {
       const b = nodes[j];
       if (a.id.length < 4 || b.id.length < 4) continue;
       if (a.id.includes(b.id) || b.id.includes(a.id)) add("one normalized name contains the other", [a, b]);
-      if (acronymFor(a.name) && acronymFor(a.name) === b.id) add("acronym match", [a, b]);
-      if (acronymFor(b.name) && acronymFor(b.name) === a.id) add("acronym match", [a, b]);
+      if (isAcronymLike(a.name) && acronymFor(b.name) === a.id) add("exact acronym-name match", [a, b]);
+      if (isAcronymLike(b.name) && acronymFor(a.name) === b.id) add("exact acronym-name match", [a, b]);
       if (tokenOverlapScore(a.name, b.name) >= 0.8) add("high token overlap", [a, b]);
       if (hasDisambiguator(a.name) && baseTitleKey(a.name) === b.id) add("same base title with disambiguator", [a, b]);
       if (hasDisambiguator(b.name) && baseTitleKey(b.name) === a.id) add("same base title with disambiguator", [a, b]);
@@ -933,18 +1211,57 @@ async function handleApiInfluences(req, res) {
       });
     }
 
-    const result = await callDeepSeek(entity, context);
+    const identityPlan = shouldResolveIdentity(entity, context);
+    let identityResult = null;
+    let generationEntity = entity;
+    if (identityPlan.shouldResolve) {
+      identityResult = await callIdentityResolution(entity, context);
+      if (usableIdentityResolution(identityResult.data)) {
+        generationEntity = identityResult.data.canonicalName;
+      }
+    }
+
+    const result = await callDeepSeek(generationEntity, context);
+    const identitySuggestions = storeExpansionIdentitySuggestion(entity, result.data.entity, context);
     const response = {
       provider: "deepseek",
       model: DEEPSEEK_MODEL,
-      data: result.data
+      data: result.data,
+      identity: identityResult ? identityResult.data : null,
+      identityCandidates: identityPlan.candidates,
+      identitySuggestions
     };
     if (hasAdminAccess(req, new URL(req.url, `http://${req.headers.host}`))) {
-      response.debugPrompt = result.prompt;
+      response.debugPrompt = buildPromptBundle({
+        identity: identityResult && identityResult.prompt,
+        expansion: result.prompt
+      });
     }
     return sendJson(res, 200, response);
   } catch (error) {
     sendJson(res, 500, { error: error.message || "Influence generation failed" });
+  }
+}
+
+async function handleApiInfluencePrompt(req, res, url) {
+  if (!requireAdmin(req, res, url)) return;
+  try {
+    const raw = await readBody(req);
+    const body = raw ? JSON.parse(raw) : {};
+    const entity = normalizeName(body.entity);
+    const context = sanitizeExpansionContext(body.context);
+    if (!entity) return sendJson(res, 400, { error: "Missing entity" });
+    const identityPlan = shouldResolveIdentity(entity, context);
+    return sendJson(res, 200, {
+      debugPrompt: buildPromptBundle({
+        identity: identityPlan.shouldResolve ? buildIdentityMessages(entity, context) : null,
+        expansion: buildInfluenceMessages(entity, context)
+      }),
+      identityCandidates: identityPlan.candidates,
+      identityWillRun: identityPlan.shouldResolve
+    });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message || "Prompt preview failed" });
   }
 }
 
@@ -1028,13 +1345,18 @@ async function handleApiDedupeDecision(req, res, url, id, decision) {
       db.exec("BEGIN");
       try {
         const parsed = rowToSuggestion(suggestion);
-        mergeNodes(parsed.canonical, parsed.entities);
+        if (parsed.action === "merge") {
+          mergeNodes(parsed.canonical, parsed.entities);
+          setSetting("savedAt", timestamp);
+        } else if (parsed.action === "split") {
+          approveSplitSuggestion(suggestion);
+          setSetting("savedAt", timestamp);
+        }
         db.prepare(`
           UPDATE dedupe_suggestions
           SET status = 'approved', updated_at = ?, reviewed_at = ?
           WHERE id = ?
         `).run(timestamp, timestamp, id);
-        setSetting("savedAt", timestamp);
         db.exec("COMMIT");
       } catch (error) {
         db.exec("ROLLBACK");
@@ -1090,6 +1412,10 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (req.method === "POST" && url.pathname === "/api/influences") {
     handleApiInfluences(req, res);
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/influence-prompt") {
+    handleApiInfluencePrompt(req, res, url);
     return;
   }
   if ((req.method === "GET" || req.method === "PUT") && url.pathname === "/api/graph") {

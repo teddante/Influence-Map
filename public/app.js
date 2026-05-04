@@ -11,6 +11,7 @@ const state = {
   devTools: false,
   expanding: new Set(),
   dragging: null,
+  hovered: null,
   pan: { x: 0, y: 0 },
   zoom: 1,
   lastPointer: null,
@@ -24,6 +25,7 @@ const state = {
   tableSort: "popularity",
   tableDirection: "desc",
   tableFilter: "",
+  panelTab: "selected",
   activities: [],
   activityCounter: 0
 };
@@ -37,6 +39,8 @@ const els = {
   autoBudget: document.querySelector("#auto-budget"),
   autoExpand: document.querySelector("#auto-expand"),
   reset: document.querySelector("#reset-graph"),
+  fitGraph: document.querySelector("#fit-graph"),
+  centerSelected: document.querySelector("#center-selected"),
   graphView: document.querySelector("#graph-view"),
   tableView: document.querySelector("#table-view"),
   workspace: document.querySelector(".workspace"),
@@ -51,7 +55,12 @@ const els = {
   activityList: document.querySelector("#activity-list"),
   selectedDetails: document.querySelector("#selected-details"),
   dedupeReview: document.querySelector("#dedupe-review"),
-  dedupeOutput: document.querySelector("#dedupe-output")
+  dedupeOutput: document.querySelector("#dedupe-output"),
+  panelTabs: document.querySelectorAll("[data-panel-tab]"),
+  panelPages: document.querySelectorAll("[data-panel-page]"),
+  promptModal: document.querySelector("#prompt-modal"),
+  promptModalContent: document.querySelector("#prompt-modal-content"),
+  promptModalClose: document.querySelector("#prompt-modal-close")
 };
 
 const MIN_ZOOM = 0.04;
@@ -133,6 +142,13 @@ function renameNode(nodeOrName, nextName) {
   }
 
   const previous = state.nodes.get(previousId);
+  if (previousId !== nextId && state.expanded.has(previousId)) {
+    const canonicalNode = ensureNode(canonical);
+    if (canonicalNode && !canonicalNode.aliases.includes(previous.name)) {
+      canonicalNode.aliases.push(previous.name);
+    }
+    return canonicalNode;
+  }
   const target = state.nodes.get(nextId);
   const aliases = new Set([
     previous.name,
@@ -284,6 +300,56 @@ function focusNode(node, targetZoom) {
   return true;
 }
 
+function clearSelection() {
+  state.selected = null;
+  state.hovered = null;
+  setStatus("Selection cleared.");
+  updateUi();
+}
+
+function selectedNodeId() {
+  return state.selected && state.selected.type === "node" ? state.selected.id : "";
+}
+
+function highlightedNodeIds() {
+  const rootId = selectedNodeId() || state.hovered || "";
+  const ids = new Set();
+  if (!rootId) return ids;
+  ids.add(rootId);
+  for (const edge of [...state.edges.values(), ...state.hiddenEdges.values()]) {
+    if (edge.from.id === rootId) ids.add(edge.to.id);
+    if (edge.to.id === rootId) ids.add(edge.from.id);
+  }
+  return ids;
+}
+
+function fitGraph() {
+  const nodes = [...state.nodes.values()];
+  if (!nodes.length) return;
+  const rect = canvas.getBoundingClientRect();
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const node of nodes) {
+    const radius = nodeRadius(node) + 80;
+    minX = Math.min(minX, node.x - radius);
+    maxX = Math.max(maxX, node.x + radius);
+    minY = Math.min(minY, node.y - radius);
+    maxY = Math.max(maxY, node.y + radius);
+  }
+  const width = Math.max(1, maxX - minX);
+  const height = Math.max(1, maxY - minY);
+  const zoom = clampZoom(Math.min(rect.width / width, rect.height / height) * 0.92);
+  state.zoom = zoom;
+  state.pan = {
+    x: rect.width / 2 - ((minX + maxX) / 2) * zoom,
+    y: rect.height / 2 - ((minY + maxY) / 2) * zoom
+  };
+  scheduleSave();
+  updateUi();
+}
+
 function findNodeByQuery(query) {
   const needle = canonicalName(query);
   if (!needle) return null;
@@ -309,6 +375,17 @@ function setView(view) {
   els.tableView.setAttribute("aria-pressed", String(state.view === "table"));
   if (state.view === "table") renderEntityTable();
   if (state.view === "graph") resizeCanvas();
+}
+
+function setPanelTab(tab) {
+  state.panelTab = tab;
+  els.panelTabs.forEach(button => {
+    const active = button.getAttribute("data-panel-tab") === tab;
+    button.setAttribute("aria-pressed", String(active));
+  });
+  els.panelPages.forEach(page => {
+    page.hidden = page.getAttribute("data-panel-page") !== tab;
+  });
 }
 
 function entityStats() {
@@ -426,6 +503,150 @@ function updateActivity(id, patch = {}) {
   renderActivityList();
 }
 
+function promptTextFor(prompt) {
+  const messages = prompt && prompt.messages ? prompt.messages : null;
+  if (!messages) return "";
+  return messages.map(message => {
+    const stage = message.stage ? ` [${message.stage}]` : "";
+    return `${message.role.toUpperCase()}${stage}\n${message.content}`;
+  }).join("\n\n---\n\n");
+}
+
+function formatJson(value) {
+  try {
+    return JSON.stringify(typeof value === "string" ? JSON.parse(value) : value, null, 2);
+  } catch {
+    return String(value || "");
+  }
+}
+
+function parsedUserPayload(prompt, stage = "") {
+  const messages = prompt && prompt.messages ? prompt.messages : [];
+  const user = messages.find(message => message.role === "user" && (!stage || message.stage === stage))
+    || messages.find(message => message.role === "user");
+  if (!user) return null;
+  try {
+    return JSON.parse(user.content);
+  } catch {
+    return null;
+  }
+}
+
+function systemLinesFor(prompt, stage = "") {
+  const messages = prompt && prompt.messages ? prompt.messages : [];
+  const system = messages.find(message => message.role === "system" && (!stage || message.stage === stage))
+    || messages.find(message => message.role === "system");
+  return system ? system.content.split(". ").filter(Boolean) : [];
+}
+
+function contextRows(items, emptyLabel) {
+  if (!items || !items.length) return `<p class="prompt-muted">${escapeHtml(emptyLabel)}</p>`;
+  return `<ul class="prompt-list">${items.map(item => `
+    <li>
+      <strong>${escapeHtml(item.sourceEntity || item.entity || "Context")}</strong>
+      <span>${escapeHtml(item.relation || "")}${Number.isFinite(Number(item.confidence)) ? ` - ${Math.round(Number(item.confidence) * 100)}%` : ""}</span>
+    </li>
+  `).join("")}</ul>`;
+}
+
+function renderPromptStage(prompt, stage, title) {
+  const payload = parsedUserPayload(prompt, stage);
+  if (!payload) {
+    return "";
+  }
+
+  const isIdentity = payload.localCandidates;
+  const isInfluence = !isIdentity && (payload.task || payload.entity || payload.context);
+  const isDedupe = payload.candidates || payload.entityNames;
+  const systemLines = systemLinesFor(prompt, stage);
+
+  return `
+    <section class="prompt-card">
+      <h3>${escapeHtml(title)}</h3>
+    <div class="prompt-summary">
+      ${isInfluence ? `
+        <div><span>Task</span><strong>${escapeHtml(payload.task || "Influence expansion")}</strong></div>
+        <div><span>Entity</span><strong>${escapeHtml(payload.entity || "")}</strong></div>
+      ` : ""}
+      ${isDedupe ? `
+        <div><span>Task</span><strong>Dedupe review</strong></div>
+        <div><span>Candidate groups</span><strong>${Array.isArray(payload.candidates) ? payload.candidates.length : 0}</strong></div>
+      ` : ""}
+      ${isIdentity ? `
+        <div><span>Task</span><strong>Identity check</strong></div>
+        <div><span>Local candidates</span><strong>${Array.isArray(payload.localCandidates) ? payload.localCandidates.length : 0}</strong></div>
+      ` : ""}
+    </div>
+    ${isIdentity ? `
+      <section class="prompt-section">
+        <h3>Possible Matches</h3>
+        ${contextRows((payload.localCandidates || []).map(candidate => ({
+          entity: candidate.name,
+          relation: `${candidate.matchReason || "candidate"}${candidate.score ? `, ${Math.round(candidate.score * 100)}% local score` : ""}`
+        })), "No local candidates were sent.")}
+      </section>
+    ` : ""}
+    ${isInfluence ? `
+      <section class="prompt-section">
+        <h3>Context Used</h3>
+        <h4>Discovered From</h4>
+        ${contextRows(payload.context && payload.context.discoveredFrom, "No discovery context was sent.")}
+        <h4>Connected To</h4>
+        ${contextRows(payload.context && payload.context.connectedTo, "No nearby graph context was sent.")}
+      </section>
+    ` : ""}
+    ${isDedupe ? `
+      <section class="prompt-section">
+        <h3>Dedupe Candidates</h3>
+        <p class="prompt-muted">${Array.isArray(payload.entityNames) ? payload.entityNames.length : 0} entity names were included for context.</p>
+        ${contextRows((payload.candidates || []).slice(0, 20).map(candidate => ({
+          entity: (candidate.entities || []).join(", "),
+          relation: candidate.reason || "Candidate group"
+        })), "No candidates were sent.")}
+      </section>
+    ` : ""}
+    <section class="prompt-section">
+      <h3>System Instructions</h3>
+      <ul class="prompt-rules">${systemLines.map(line => `<li>${escapeHtml(line.replace(/\.$/, ""))}</li>`).join("")}</ul>
+    </section>
+    </section>
+  `;
+}
+
+function renderPromptView(prompt) {
+  const promptText = promptTextFor(prompt);
+  if (!promptText) return "";
+  const stages = prompt && prompt.stages ? Object.keys(prompt.stages) : [];
+  const stageHtml = stages.length
+    ? stages.map(stage => renderPromptStage({ messages: prompt.stages[stage].messages }, "", stage === "identity" ? "Identity Resolution" : "Influence Expansion")).join("")
+    : renderPromptStage(prompt, "", "Model Prompt");
+  const payload = parsedUserPayload(prompt);
+
+  return `
+    ${stageHtml || `<pre class="prompt-raw">${escapeHtml(promptText)}</pre>`}
+    <details class="prompt-raw-details">
+      <summary>Raw prompt</summary>
+      <pre class="prompt-raw">${escapeHtml(promptText)}</pre>
+    </details>
+    ${payload ? `<details class="prompt-raw-details">
+      <summary>Parsed user payload</summary>
+      <pre class="prompt-raw">${escapeHtml(formatJson(payload))}</pre>
+    </details>` : ""}
+  `;
+}
+
+function openPromptModal(prompt) {
+  const html = renderPromptView(prompt);
+  if (!html) return;
+  els.promptModalContent.innerHTML = html;
+  els.promptModal.hidden = false;
+}
+
+function closePromptModal() {
+  els.promptModal.hidden = true;
+  els.promptModalContent.innerHTML = "";
+}
+
 function renderActivityList() {
   if (!els.activityList) return;
   if (!state.activities.length) {
@@ -433,16 +654,13 @@ function renderActivityList() {
     return;
   }
   els.activityList.innerHTML = state.activities.map(activity => {
-    const prompt = activity.prompt && activity.prompt.messages ? activity.prompt.messages : null;
-    const promptText = prompt ? prompt.map(message => (
-      `${message.role.toUpperCase()}\n${message.content}`
-    )).join("\n\n---\n\n") : "";
+    const hasPrompt = Boolean(promptTextFor(activity.prompt));
     return `
-    <div class="activity-item ${escapeHtml(activity.status)}">
+    <div class="activity-item ${escapeHtml(activity.status)}" data-activity="${escapeHtml(activity.id)}">
       <div>
         <strong>${escapeHtml(activity.title)}</strong>
         <span>${escapeHtml(activity.detail || activity.type)}</span>
-        ${promptText ? `<details class="prompt-debug"><summary>Prompt</summary><pre>${escapeHtml(promptText)}</pre></details>` : ""}
+        ${hasPrompt ? `<button type="button" class="prompt-button" data-prompt-activity="${escapeHtml(activity.id)}">View prompt</button>` : ""}
       </div>
       <em>${escapeHtml(activity.status)} ${escapeHtml(activityTime(activity.updatedAt))}</em>
     </div>
@@ -620,23 +838,54 @@ async function fetchInfluences(entity, context = {}) {
   return payload;
 }
 
+async function fetchInfluencePrompt(entity, context = {}) {
+  if (!state.devTools) return null;
+  const response = await fetch("/api/influence-prompt", {
+    method: "POST",
+    headers: { "content-type": "application/json", ...adminHeaders() },
+    body: JSON.stringify({ entity, context })
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Prompt preview failed");
+  return payload.debugPrompt || null;
+}
+
 function renderDedupeSuggestions(suggestions) {
   if (!els.dedupeOutput) return;
   if (!suggestions || !suggestions.length) {
     els.dedupeOutput.textContent = "No pending duplicate suggestions.";
     return;
   }
-  els.dedupeOutput.innerHTML = suggestions.map(item => `
+  els.dedupeOutput.innerHTML = suggestions.map(item => {
+    const isMerge = item.action === "merge";
+    const isSplit = item.action === "split";
+    const moveCandidates = item.metadata && Array.isArray(item.metadata.moveCandidates) ? item.metadata.moveCandidates : [];
+    const title = isMerge ? item.canonical : isSplit ? "Split review" : "Identity review";
+    const approveLabel = isMerge ? "Approve merge" : isSplit ? "Approve split" : "Mark reviewed";
+    const reviewText = isMerge
+      ? "Only approve if every listed name is the same real entity. Reject if this is a related topic, parent series, sequel, adaptation, shared acronym, broad category, or a different sense that should stay separate."
+      : isSplit
+        ? "Approving moves only the listed context-linked observations to the resolved entity. It does not merge the whole node."
+        : "This is a model identity/canonicalization signal. Approving records the review only; it does not merge nodes. Use it to decide whether a future merge, rename, or split tool should be applied.";
+    return `
     <div class="dedupe-group" data-suggestion="${item.id}">
-      <strong>${escapeHtml(item.canonical)}</strong>
+      <strong>${escapeHtml(title)}</strong>
       <div>${escapeHtml(item.entities.join(", "))}</div>
       <span>${Math.round(Number(item.confidence || 0) * 100)}% - ${escapeHtml(item.reason || "Possible duplicate")}</span>
+      ${moveCandidates.length ? `<ul class="move-candidates">${moveCandidates.map(candidate => `
+        <li>${escapeHtml(candidate.from)} -> ${escapeHtml(candidate.to)} <span>${Math.round(Number(candidate.confidence || 0) * 100)}%</span></li>
+      `).join("")}</ul>` : ""}
+      <details class="dedupe-review-details">
+        <summary>Review decision</summary>
+        <p>${reviewText}</p>
+      </details>
       <div class="dedupe-actions">
-        <button type="button" data-dedupe-action="approve" data-id="${item.id}">Approve merge</button>
+        <button type="button" data-dedupe-action="approve" data-id="${item.id}">${approveLabel}</button>
         <button type="button" data-dedupe-action="reject" data-id="${item.id}">Reject</button>
       </div>
     </div>
-  `).join("");
+  `;
+  }).join("");
 }
 
 async function loadDedupeSuggestions() {
@@ -684,8 +933,22 @@ async function expandEntity(entity, options = {}) {
     const beforeNodeCount = state.nodes.size;
     const beforeEdgeCount = state.edges.size + state.hiddenEdges.size;
     const beforeObservationCount = state.observations.length;
+    fetchInfluencePrompt(node.name, context)
+      .then(prompt => {
+        if (prompt) updateActivity(activityId, { prompt });
+      })
+      .catch(error => updateActivity(activityId, { detail: `Prompt preview unavailable: ${error.message}` }));
     const payload = await fetchInfluences(node.name, context);
     if (payload.debugPrompt) updateActivity(activityId, { prompt: payload.debugPrompt });
+    if (payload.identity) {
+      const identityPercent = Math.round(Number(payload.identity.confidence || 0) * 100);
+      updateActivity(activityId, {
+        detail: `Identity ${payload.identity.decision}: ${payload.identity.canonicalName} (${identityPercent}%), applying expansion`
+      });
+    }
+    if (payload.identitySuggestions && state.devTools) {
+      loadDedupeSuggestions().catch(() => {});
+    }
     const data = payload.data;
     const canonicalNode = renameNode(node, data.entity);
     const canonicalEntity = canonicalNode ? canonicalNode.name : displayName(data.entity || node.name);
@@ -728,10 +991,14 @@ async function expandEntity(entity, options = {}) {
     const resultDetail = shapeChanged
       ? `${payload.provider}/${payload.model} added ${addedObservations} observations, ${addedNodes} entities, ${addedEdges} edges`
       : `${payload.provider}/${payload.model} added ${addedObservations} observation${addedObservations === 1 ? "" : "s"} to existing links; graph shape unchanged`;
+    const identityDetail = payload.identitySuggestions ? " Identity review queued." : "";
+    const resolvedDetail = payload.identity && payload.identity.canonicalName !== node.name
+      ? ` Identity checked as ${payload.identity.canonicalName}.`
+      : "";
     updateActivity(activityId, {
       status: "done",
       title: resultTitle,
-      detail: resultDetail
+      detail: `${resultDetail}${resolvedDetail}${identityDetail}`
     });
     setStatus(shapeChanged
       ? `${wasExpanded ? "Sampled" : "Expanded"} ${canonicalEntity} using ${payload.provider}/${payload.model}.`
@@ -846,7 +1113,7 @@ function simulatePhysics() {
   }
 }
 
-function drawArrow(from, to, confidence, count, selected, hidden = false) {
+function drawArrow(from, to, confidence, count, selected, hidden = false, faded = false) {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
@@ -861,10 +1128,10 @@ function drawArrow(from, to, confidence, count, selected, hidden = false) {
   const dashed = hidden || (weak && !selected);
 
   ctx.strokeStyle = hidden
-    ? "rgba(102, 112, 109, 0.18)"
+    ? `rgba(102, 112, 109, ${faded ? 0.06 : 0.18})`
     : selected
       ? "#b4472f"
-      : `rgba(31, 35, 38, ${weak ? 0.16 + confidence * 0.34 : 0.2 + confidence * 0.48})`;
+      : `rgba(31, 35, 38, ${faded ? 0.08 : weak ? 0.16 + confidence * 0.34 : 0.2 + confidence * 0.48})`;
   ctx.lineWidth = hidden ? 1 : weak ? Math.max(1, width * 0.72) : width;
   if (dashed) ctx.setLineDash([5, 7]);
   ctx.beginPath();
@@ -891,19 +1158,26 @@ function draw() {
   ctx.save();
   ctx.translate(state.pan.x, state.pan.y);
   ctx.scale(state.zoom, state.zoom);
+  const highlights = highlightedNodeIds();
+  const hasFocus = highlights.size > 0;
 
   for (const edge of state.hiddenEdges.values()) {
-    drawArrow(edge.from, edge.to, edge.confidence, edge.count, false, true);
+    const related = !hasFocus || (highlights.has(edge.from.id) && highlights.has(edge.to.id));
+    drawArrow(edge.from, edge.to, edge.confidence, edge.count, false, true, !related);
   }
 
   for (const [key, edge] of state.edges) {
-    drawArrow(edge.from, edge.to, edge.confidence, edge.count, state.selected && state.selected.type === "edge" && state.selected.key === key);
+    const selected = state.selected && state.selected.type === "edge" && state.selected.key === key;
+    const related = !hasFocus || selected || (highlights.has(edge.from.id) && highlights.has(edge.to.id));
+    drawArrow(edge.from, edge.to, edge.confidence, edge.count, selected, false, !related);
   }
 
   for (const node of state.nodes.values()) {
     const expanded = state.expanded.has(node.id);
     const expanding = state.expanding.has(node.id);
     const selected = state.selected && state.selected.type === "node" && state.selected.id === node.id;
+    const hovered = state.hovered === node.id;
+    const related = !hasFocus || highlights.has(node.id);
     const radius = nodeRadius(node);
     if (expanding) {
       const pulse = 5 + Math.sin(Date.now() / 180) * 3;
@@ -913,15 +1187,19 @@ function draw() {
       ctx.arc(node.x, node.y, radius + 9 + pulse, 0, Math.PI * 2);
       ctx.stroke();
     }
+    ctx.globalAlpha = related ? 1 : 0.24;
     ctx.fillStyle = expanded ? "#35a186" : "#f0b84d";
-    ctx.strokeStyle = expanding || selected ? "#b4472f" : "#1f2326";
-    ctx.lineWidth = expanding || selected ? 4 : 1.5;
+    ctx.strokeStyle = expanding || selected || hovered ? "#b4472f" : "#1f2326";
+    ctx.lineWidth = expanding || selected || hovered ? 4 : 1.5;
     ctx.beginPath();
     ctx.arc(node.x, node.y, selected ? radius + 3 : radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
+    ctx.globalAlpha = 1;
 
-    ctx.fillStyle = "#1f2326";
+    const showLabel = selected || hovered || expanding || state.zoom > 0.65 || node.weightedPopularity > state.maxWeightedPopularity * 0.16;
+    if (!showLabel) continue;
+    ctx.fillStyle = related ? "#1f2326" : "rgba(31, 35, 38, 0.35)";
     ctx.font = "13px system-ui, sans-serif";
     ctx.textAlign = "center";
     ctx.textBaseline = "top";
@@ -968,7 +1246,7 @@ function hitEdge(point) {
 
 function updateSelectedDetails() {
   if (!state.selected) {
-    els.selectedDetails.textContent = "Click a node or edge.";
+    els.selectedDetails.innerHTML = `Click a node or edge.<br><button id="clear-selection" type="button" disabled>Clear selection</button>`;
     return;
   }
   if (state.selected.type === "node") {
@@ -986,12 +1264,14 @@ function updateSelectedDetails() {
     const stateLabel = isExpanding ? "Expanding now..." : isExpanded ? "Expanded" : "Not expanded yet";
     const actionLabel = isExpanding ? "Expanding..." : isExpanded ? "Sample again" : "Expand this entity";
     const actionHint = isExpanded && !isExpanding ? "<br><span>Runs another model pass and adds new observations without deleting existing ones.</span>" : "";
-    const action = `<br><button id="expand-selected" type="button" ${isExpanding ? "disabled" : ""}>${actionLabel}</button>${actionHint}`;
+    const action = `<br><button id="expand-selected" type="button" ${isExpanding ? "disabled" : ""}>${actionLabel}</button><button id="clear-selection" type="button">Clear selection</button>${actionHint}`;
     els.selectedDetails.innerHTML = `<strong>${node.name}</strong><br>Visible incoming: ${incoming}<br>Visible outgoing: ${outgoing}${hiddenLine}<br>Popularity: ${Number(node.weightedPopularity || 0).toFixed(2)} weighted observations<br>Relative size: ${popularityPercent(node)}% of current max${aliases}<br>${stateLabel}${action}`;
     const button = document.querySelector("#expand-selected");
     if (button) {
       button.addEventListener("click", () => expandEntity(node.name).catch(error => setStatus(error.message)));
     }
+    const clearButton = document.querySelector("#clear-selection");
+    if (clearButton) clearButton.addEventListener("click", clearSelection);
     return;
   }
   const edge = state.edges.get(state.selected.key);
@@ -1001,7 +1281,9 @@ function updateSelectedDetails() {
     const model = obs.model ? ` via ${obs.model}` : "";
     return `<li>${Number(obs.confidence).toFixed(3)}${source}${model}<br><span>${when}</span></li>`;
   }).join("");
-  els.selectedDetails.innerHTML = `<strong>${edge.from.name} -> ${edge.to.name}</strong><br>Average confidence: ${edge.confidence.toFixed(3)}<br>Observations: ${edge.count}<ul class="observation-list">${rows}</ul>`;
+  els.selectedDetails.innerHTML = `<strong>${edge.from.name} -> ${edge.to.name}</strong><br>Average confidence: ${edge.confidence.toFixed(3)}<br>Observations: ${edge.count}<button id="clear-selection" type="button">Clear selection</button><ul class="observation-list">${rows}</ul>`;
+  const clearButton = document.querySelector("#clear-selection");
+  if (clearButton) clearButton.addEventListener("click", clearSelection);
 }
 
 function updateUi() {
@@ -1031,6 +1313,10 @@ canvas.addEventListener("pointerdown", event => {
     updateUi();
     return;
   }
+  if (state.selected) {
+    state.selected = null;
+    updateUi();
+  }
   state.lastPointer = { x: event.clientX, y: event.clientY };
 });
 
@@ -1044,6 +1330,8 @@ canvas.addEventListener("pointermove", event => {
     node.vy = 0;
     return;
   }
+  const hoverNode = hitNode(graphPoint(event));
+  state.hovered = hoverNode ? hoverNode.id : null;
   if (state.lastPointer) {
     state.pan.x += event.clientX - state.lastPointer.x;
     state.pan.y += event.clientY - state.lastPointer.y;
@@ -1096,6 +1384,28 @@ els.focusEntity.addEventListener("click", () => {
 
 els.graphView.addEventListener("click", () => setView("graph"));
 els.tableView.addEventListener("click", () => setView("table"));
+els.fitGraph.addEventListener("click", fitGraph);
+els.centerSelected.addEventListener("click", () => {
+  const node = state.selected && state.selected.type === "node" ? state.nodes.get(state.selected.id) : null;
+  if (node) focusNode(node, 1.15);
+  else fitGraph();
+});
+
+els.panelTabs.forEach(button => {
+  button.addEventListener("click", () => setPanelTab(button.getAttribute("data-panel-tab")));
+});
+
+els.activityList.addEventListener("click", event => {
+  const button = event.target.closest("[data-prompt-activity]");
+  if (!button) return;
+  const activity = state.activities.find(item => item.id === button.getAttribute("data-prompt-activity"));
+  if (activity) openPromptModal(activity.prompt);
+});
+
+els.promptModalClose.addEventListener("click", closePromptModal);
+els.promptModal.addEventListener("click", event => {
+  if (event.target.closest("[data-close-modal]")) closePromptModal();
+});
 
 document.querySelectorAll("[data-sort]").forEach(button => {
   button.addEventListener("click", () => {
@@ -1188,6 +1498,11 @@ els.minConfidence.addEventListener("input", () => {
 });
 
 window.addEventListener("resize", resizeCanvas);
+window.addEventListener("keydown", event => {
+  if (event.key === "Escape" && state.selected) {
+    clearSelection();
+  }
+});
 
 resizeCanvas();
 loadConfig().then(loadGraph);

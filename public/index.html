@@ -38,6 +38,10 @@
 
       <section class="workspace">
         <canvas id="graph-canvas" width="1200" height="800" aria-label="Influence graph"></canvas>
+        <div class="graph-tools">
+          <button id="fit-graph" type="button">Fit</button>
+          <button id="center-selected" type="button">Center</button>
+        </div>
         <aside class="panel">
           <div class="status" id="status">Ready.</div>
           <div class="metrics">
@@ -46,11 +50,21 @@
             <div><span>Observations</span><strong id="observation-count">0</strong></div>
             <div><span>Expanded</span><strong id="expanded-count">0</strong></div>
           </div>
-          <section>
+          <div class="panel-tabs" aria-label="Panel sections">
+            <button type="button" data-panel-tab="selected" aria-pressed="true">Selected</button>
+            <button type="button" data-panel-tab="activity" aria-pressed="false">Activity</button>
+            <button type="button" data-panel-tab="dedupe" aria-pressed="false" class="dev-only">Dedupe</button>
+            <button type="button" data-panel-tab="guide" aria-pressed="false">Guide</button>
+          </div>
+          <section class="panel-page" data-panel-page="selected">
+            <h2>Selected</h2>
+            <div id="selected-details" class="details">Click a node or edge.</div>
+          </section>
+          <section class="panel-page" data-panel-page="activity" hidden>
             <h2>Activity</h2>
             <div id="activity-list" class="activity-list">Nothing running.</div>
           </section>
-          <section>
+          <section class="panel-page" data-panel-page="guide" hidden>
             <h2>Guide</h2>
             <div class="guide">
               <div class="guide-row">
@@ -86,11 +100,7 @@
               </div>
             </div>
           </section>
-          <section>
-            <h2>Selected</h2>
-            <div id="selected-details" class="details">Click a node or edge.</div>
-          </section>
-          <section class="dev-only">
+          <section class="panel-page dev-only" data-panel-page="dedupe" hidden>
             <h2>Dedupe Review</h2>
             <div class="details">
               <button id="dedupe-review" type="button">Review possible duplicates</button>
@@ -127,6 +137,16 @@
         </div>
       </section>
     </main>
+    <div id="prompt-modal" class="modal" hidden>
+      <div class="modal-backdrop" data-close-modal></div>
+      <section class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="prompt-modal-title">
+        <div class="modal-header">
+          <h2 id="prompt-modal-title">LLM Prompt</h2>
+          <button id="prompt-modal-close" type="button" aria-label="Close prompt">Close</button>
+        </div>
+        <div id="prompt-modal-content" class="prompt-view"></div>
+      </section>
+    </div>
     <script src="/app.js"></script>
   </body>
 </html>
