@@ -19,6 +19,9 @@ const DEFAULT_LLM_PROVIDER = (process.env.INFLUENCE_MAP_LLM_PROVIDER || "deepsee
 const LLM_MAX_CONCURRENCY = Math.max(1, Number(process.env.INFLUENCE_MAP_LLM_CONCURRENCY || 1) || 1);
 const LLM_REQUEST_TIMEOUT_MS = Math.max(10_000, Number(process.env.INFLUENCE_MAP_LLM_TIMEOUT_MS || 45_000) || 45_000);
 const LLM_MAX_TOKENS = Math.max(0, Number(process.env.INFLUENCE_MAP_LLM_MAX_TOKENS || 0) || 0);
+const IDENTITY_AUTO_APPROVE = process.env.INFLUENCE_MAP_IDENTITY_AUTO_APPROVE !== "0";
+const IDENTITY_AUTO_MERGE_CONFIDENCE = Math.max(0.5, Math.min(1, Number(process.env.INFLUENCE_MAP_AUTO_MERGE_CONFIDENCE || 0.72) || 0.72));
+const IDENTITY_AUTO_SPLIT_CONFIDENCE = Math.max(0.5, Math.min(1, Number(process.env.INFLUENCE_MAP_AUTO_SPLIT_CONFIDENCE || 0.78) || 0.78));
 const DEV_TOOLS = process.env.INFLUENCE_MAP_DEV_TOOLS === "1";
 const ADMIN_TOKEN = process.env.INFLUENCE_MAP_ADMIN_TOKEN || "";
 const profileEvents = [];
@@ -825,8 +828,37 @@ function mergeNodes(canonical, entities) {
   };
 }
 
+function renameNodeInDb(source, canonical) {
+  const sourceName = normalizeName(source);
+  const canonicalName = normalizeName(canonical);
+  const sourceId = keyFor(sourceName);
+  const canonicalId = keyFor(canonicalName);
+  if (!sourceId || !canonicalId || !sourceName || !canonicalName) {
+    throw new Error("Rename needs a source and canonical name");
+  }
+  if (sourceId === canonicalId) {
+    const row = db.prepare("SELECT * FROM nodes WHERE id = ?").get(sourceId);
+    if (!row || row.name === canonicalName) return { changed: false, reason: "Already named correctly" };
+    const aliases = new Set(parseJson(row.aliases, []));
+    aliases.add(row.name);
+    db.prepare("UPDATE nodes SET name = ?, aliases = ?, updated_at = ? WHERE id = ?").run(
+      canonicalName,
+      JSON.stringify([...aliases].filter(alias => alias && alias !== canonicalName).slice(0, 40)),
+      nowIso(),
+      sourceId
+    );
+    db.prepare("UPDATE observations SET source_entity = ? WHERE lower(source_entity) = lower(?)").run(canonicalName, sourceName);
+    return { changed: true, reason: `Renamed ${sourceName} to ${canonicalName}` };
+  }
+  return mergeNodes(canonicalName, [sourceName, canonicalName]);
+}
+
 function approveSplitSuggestion(suggestion) {
   const parsed = rowToSuggestion(suggestion);
+  return applySplitDecision(parsed);
+}
+
+function applySplitDecision(parsed) {
   const metadata = parsed.metadata || {};
   const ids = Array.isArray(metadata.moveObservationIds)
     ? metadata.moveObservationIds.map(Number).filter(Number.isFinite)
@@ -1491,24 +1523,32 @@ function splitCandidatesFor(requestedEntity, canonicalEntity, context = {}) {
     .slice(0, 24);
 }
 
-function storeExpansionIdentitySuggestion(requestedEntity, canonicalEntity, context = {}) {
+function expansionIdentityGroup(requestedEntity, canonicalEntity, context = {}, identity = null) {
   const requested = normalizeName(requestedEntity);
   const canonical = normalizeName(canonicalEntity);
-  if (!requested || !canonical || keyFor(requested) === keyFor(canonical)) return 0;
+  if (!requested || !canonical || keyFor(requested) === keyFor(canonical)) return null;
   const moveCandidates = splitCandidatesFor(requested, canonical, context);
-  return storeDedupeSuggestions([{
+  const confidence = clampConfidence(identity && identity.confidence);
+  return {
     canonical,
     entities: [requested, canonical],
-    confidence: moveCandidates.length ? 0.72 : 0.66,
-    action: moveCandidates.length ? "split" : "identity",
+    confidence: confidence || (moveCandidates.length ? 0.72 : 0.66),
+    action: moveCandidates.length ? "split" : "rename",
     metadata: {
       moveObservationIds: moveCandidates.map(item => item.id),
-      moveCandidates
+      moveCandidates,
+      identityDecision: identity && identity.decision,
+      identityReason: identity && identity.reason
     },
     reason: moveCandidates.length
       ? `Split review: model resolved "${requested}" as "${canonical}" and found ${moveCandidates.length} context-linked observation${moveCandidates.length === 1 ? "" : "s"} that may belong there`
       : `Expansion identity review: model resolved "${requested}" as "${canonical}"`
-  }]);
+  };
+}
+
+function storeExpansionIdentitySuggestion(requestedEntity, canonicalEntity, context = {}, identity = null) {
+  const group = expansionIdentityGroup(requestedEntity, canonicalEntity, context, identity);
+  return group ? storeDedupeSuggestions([group]) : 0;
 }
 
 function canonicalFromNames(names) {
@@ -1566,6 +1606,102 @@ function compatibleTitleVariants(names) {
     const allowed = new Set(group);
     return explicitKinds.every(set => [...set].every(kind => allowed.has(kind)));
   });
+}
+
+function identityConflictReason(names = []) {
+  const clean = (names || []).map(normalizeName).filter(Boolean);
+  const kindSets = clean.map(identityKind);
+  const explicitKinds = kindSets.filter(set => set.size);
+  const allKinds = new Set(explicitKinds.flatMap(set => [...set]));
+  if (allKinds.has("series") && allKinds.size > 1) {
+    return "series/franchise mixed with a specific work";
+  }
+
+  const yearSets = clean.map(identityYears).filter(years => years.length);
+  const years = new Set(yearSets.flat());
+  if (yearSets.length > 1 && years.size > 1) {
+    return "conflicting years";
+  }
+
+  const bases = new Set(clean.map(baseTitleKey).filter(Boolean));
+  if (bases.size === 1 && clean.some(hasDisambiguator) && !compatibleTitleVariants(clean)) {
+    return "same title but incompatible disambiguators";
+  }
+  return "";
+}
+
+function canAutoApplyIdentity(group) {
+  if (!IDENTITY_AUTO_APPROVE || !group) return { ok: false, reason: "automatic identity approval disabled" };
+  const action = group.action === "split" ? "split" : group.action === "merge" || group.action === "rename" ? "merge" : "";
+  if (!action) return { ok: false, reason: "not an actionable identity edit" };
+  const entities = [...new Set((group.entities || []).map(normalizeName).filter(Boolean))];
+  if (entities.length < 2) return { ok: false, reason: "needs at least two entities" };
+  if (entities.length > 4) return { ok: false, reason: "too many entities for automatic edit" };
+  const confidence = clampConfidence(group.confidence);
+  const threshold = action === "split" ? IDENTITY_AUTO_SPLIT_CONFIDENCE : IDENTITY_AUTO_MERGE_CONFIDENCE;
+  if (confidence < threshold) return { ok: false, reason: `confidence below ${Math.round(threshold * 100)}%` };
+  const conflict = identityConflictReason([group.canonical, ...entities]);
+  if (conflict) return { ok: false, reason: conflict };
+  if (action === "split") {
+    const ids = group.metadata && Array.isArray(group.metadata.moveObservationIds) ? group.metadata.moveObservationIds : [];
+    if (!ids.length) return { ok: false, reason: "split has no exact movable observation ids" };
+  }
+  return { ok: true, reason: "high-confidence LLM identity decision" };
+}
+
+function applyAutoIdentityGroups(groups = []) {
+  const applied = [];
+  const queued = [];
+  const skipped = [];
+  for (const group of groups || []) {
+    if (!group || group.action === "keep-separate") {
+      skipped.push({ action: group && group.action || "keep-separate", reason: group && group.reason || "keep separate" });
+      continue;
+    }
+    const gate = canAutoApplyIdentity(group);
+    if (!gate.ok) {
+      queued.push({
+        ...group,
+        metadata: {
+          ...(group.metadata || {}),
+          autoApplySkipped: gate.reason
+        },
+        reason: `${group.reason || "LLM identity decision"}; queued because ${gate.reason}`
+      });
+      continue;
+    }
+    db.exec("BEGIN");
+    try {
+      const result = group.action === "split"
+        ? applySplitDecision(group)
+        : group.action === "rename"
+          ? renameNodeInDb(group.entities[0], group.canonical)
+          : mergeNodes(group.canonical, group.entities);
+      db.exec("COMMIT");
+      applied.push({
+        action: group.action,
+        canonical: group.canonical,
+        entities: group.entities,
+        confidence: clampConfidence(group.confidence),
+        reason: group.reason || gate.reason,
+        result
+      });
+    } catch (error) {
+      db.exec("ROLLBACK");
+      queued.push({
+        ...group,
+        metadata: {
+          ...(group.metadata || {}),
+          autoApplyError: error.message
+        },
+        reason: `${group.reason || "LLM identity decision"}; queued because automatic apply failed: ${error.message}`
+      });
+    }
+  }
+  if (applied.length) {
+    setSetting("savedAt", nowIso());
+  }
+  return { applied, queued, skipped };
 }
 
 function localDedupeSuggestions(candidates) {
@@ -1740,11 +1876,41 @@ function targetedDedupeCandidates(names = []) {
 
 function localIdentityHygiene(names = []) {
   try {
-    return storeDedupeSuggestions(localDedupeSuggestions(targetedDedupeCandidates(names)));
+    const autoIdentity = applyAutoIdentityGroups(localDedupeSuggestions(targetedDedupeCandidates(names)));
+    return autoIdentity.applied.length + storeDedupeSuggestions(autoIdentity.queued);
   } catch (error) {
     console.warn(`Local identity hygiene skipped: ${error.message}`);
     return 0;
   }
+}
+
+function autoResolvePendingIdentity(limit = 100) {
+  const suggestions = pendingDedupeSuggestions().slice(0, Math.max(1, Number(limit) || 100));
+  const actionable = suggestions.filter(suggestion => ["merge", "split", "rename"].includes(suggestion.action));
+  const autoIdentity = applyAutoIdentityGroups(actionable);
+  const timestamp = nowIso();
+  for (const item of autoIdentity.applied) {
+    const key = suggestionKey(item.entities);
+    if (!key) continue;
+    db.prepare(`
+      UPDATE dedupe_suggestions
+      SET status = 'approved', updated_at = ?, reviewed_at = ?
+      WHERE entities_key = ? AND status = 'pending'
+    `).run(timestamp, timestamp, key);
+  }
+  for (const suggestion of suggestions) {
+    if (suggestion.action !== "identity") continue;
+    db.prepare(`
+      UPDATE dedupe_suggestions
+      SET status = 'approved', updated_at = ?, reviewed_at = ?
+      WHERE id = ?
+    `).run(timestamp, timestamp, suggestion.id);
+  }
+  return {
+    applied: autoIdentity.applied.length,
+    deferred: autoIdentity.queued.length,
+    clearedChecks: suggestions.filter(suggestion => suggestion.action === "identity").length
+  };
 }
 
 function namesFromInfluenceResponse(entity, data) {
@@ -1773,6 +1939,26 @@ function storeScopedIdentityGroups(groups) {
     });
   }
   return storeDedupeSuggestions(actionable);
+}
+
+function actionableScopedIdentityGroups(groups) {
+  const actionable = [];
+  for (const group of groups || []) {
+    if (group.action === "keep-separate") continue;
+    if (group.action === "split") continue;
+    actionable.push({
+      canonical: group.canonical,
+      entities: group.entities,
+      confidence: group.confidence,
+      action: "merge",
+      metadata: {
+        llmAction: group.action,
+        automatedReview: true
+      },
+      reason: `LLM scoped identity: ${group.reason || group.action}`
+    });
+  }
+  return actionable;
 }
 
 function acronymFor(name) {
@@ -1941,13 +2127,22 @@ async function handleApiInfluences(req, res) {
     const result = await callDeepSeek(generationEntity, context, config);
     timings.push({ stage: "expansion", ms: elapsedMs(expansionStage) });
     const touchedNames = namesFromInfluenceResponse(entity, result.data);
-    const localStage = process.hrtime.bigint();
+    const identityEditStage = process.hrtime.bigint();
     const scopedCandidates = scopedDedupeCandidates(touchedNames);
-    const identitySuggestions = storeExpansionIdentitySuggestion(entity, result.data.entity, context);
-    const postExpansionLocalSuggestions = localIdentityHygiene(touchedNames);
-    timings.push({ stage: "local hygiene", ms: elapsedMs(localStage) });
     const hygieneQueued = scopedCandidates.length > 0;
-    const hygienePrompt = hygieneQueued ? buildScopedIdentityMessages(touchedNames, scopedCandidates) : null;
+    const scopedReview = hygieneQueued
+      ? await callScopedIdentityReview(touchedNames, scopedCandidates, config)
+      : { groups: [], prompt: null };
+    const expansionIdentity = expansionIdentityGroup(entity, result.data.entity, context, identityResult && identityResult.data);
+    const scopedGroups = actionableScopedIdentityGroups(scopedReview.groups);
+    const autoIdentity = applyAutoIdentityGroups([
+      ...(expansionIdentity ? [expansionIdentity] : []),
+      ...scopedGroups
+    ]);
+    const identitySuggestions = storeDedupeSuggestions(autoIdentity.queued);
+    const postExpansionLocalSuggestions = localIdentityHygiene(touchedNames);
+    timings.push({ stage: "identity hygiene", ms: elapsedMs(identityEditStage) });
+    const hygienePrompt = scopedReview.prompt || (hygieneQueued ? buildScopedIdentityMessages(touchedNames, scopedCandidates) : null);
     const responseTimings = [
       ...timings,
       { stage: "total", ms: elapsedMs(started) }
@@ -1961,11 +2156,15 @@ async function handleApiInfluences(req, res) {
       thinking: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled",
       identityRan: Boolean(identityResult),
       hygieneQueued,
+      autoIdentityApplied: autoIdentity.applied.length,
+      autoIdentityQueued: autoIdentity.queued.length,
       scopedCandidates: scopedCandidates.length,
       timings: responseTimings,
       llm: {
         identityQueueMs: identityResult && identityResult.queueMs,
         identityRequestMs: identityResult && identityResult.requestMs,
+        hygieneQueueMs: scopedReview.queueMs,
+        hygieneRequestMs: scopedReview.requestMs,
         expansionQueueMs: result.queueMs,
         expansionRequestMs: result.requestMs,
         concurrency: LLM_MAX_CONCURRENCY,
@@ -1974,11 +2173,13 @@ async function handleApiInfluences(req, res) {
       },
       usage: {
         identity: identityResult && identityResult.usage,
-        expansion: result.usage
+        expansion: result.usage,
+        hygiene: scopedReview.usage
       },
       finishReason: {
         identity: identityResult && identityResult.finishReason,
-        expansion: result.finishReason
+        expansion: result.finishReason,
+        hygiene: scopedReview.finishReason
       }
     });
     const response = {
@@ -1989,20 +2190,25 @@ async function handleApiInfluences(req, res) {
       identityCandidates: identityPlan.candidates,
       scopedIdentityReview: {
         candidates: scopedCandidates.length,
-        groups: [],
+        groups: scopedReview.groups,
         queued: hygieneQueued
       },
       identitySuggestions,
-      llmHygieneSuggestions: 0,
+      llmHygieneSuggestions: autoIdentity.queued.length,
       localHygieneSuggestions: postExpansionLocalSuggestions,
+      autoIdentityApplied: autoIdentity.applied.length,
+      autoIdentity,
       hygieneQueued,
       usage: {
         identity: identityResult && identityResult.usage,
-        expansion: result.usage
+        expansion: result.usage,
+        hygiene: scopedReview.usage
       },
       llm: {
         identityQueueMs: identityResult && identityResult.queueMs,
         identityRequestMs: identityResult && identityResult.requestMs,
+        hygieneQueueMs: scopedReview.queueMs,
+        hygieneRequestMs: scopedReview.requestMs,
         expansionQueueMs: result.queueMs,
         expansionRequestMs: result.requestMs,
         concurrency: LLM_MAX_CONCURRENCY,
@@ -2011,8 +2217,10 @@ async function handleApiInfluences(req, res) {
       },
       finishReason: {
         identity: identityResult && identityResult.finishReason,
-        expansion: result.finishReason
+        expansion: result.finishReason,
+        hygiene: scopedReview.finishReason
       },
+      graph: autoIdentity.applied.length ? graphFromDb() : null,
       timings: responseTimings
     };
     if (hasAdminAccess(req, new URL(req.url, `http://${req.headers.host}`))) {
@@ -2116,12 +2324,14 @@ async function handleApiDedupeReview(req, res, url) {
     const candidates = dedupeCandidatesFromDb();
     const review = await callDedupeReview(candidates, config);
     const localGroups = localDedupeSuggestions(candidates);
-    const stored = storeDedupeSuggestions([...localGroups, ...review.groups]);
+    const autoIdentity = applyAutoIdentityGroups([...localGroups, ...review.groups.map(group => ({ ...group, action: group.action || "merge" }))]);
+    const stored = storeDedupeSuggestions(autoIdentity.queued);
     const response = {
       candidates,
       review,
       localGroups,
       stored,
+      autoIdentity,
       pending: pendingDedupeSuggestions(),
       provider: config.apiKey ? config.provider : "",
       model: config.apiKey ? config.model : "",
@@ -2137,7 +2347,11 @@ async function handleApiDedupeReview(req, res, url) {
 async function handleApiDedupeSuggestions(req, res, url) {
   if (!requireAdmin(req, res, url)) return;
   try {
-    sendJson(res, 200, { suggestions: pendingDedupeSuggestions() });
+    const autoIdentity = autoResolvePendingIdentity();
+    sendJson(res, 200, {
+      suggestions: pendingDedupeSuggestions(),
+      autoIdentity
+    });
   } catch (error) {
     sendJson(res, 500, { error: error.message || "Could not load dedupe suggestions" });
   }

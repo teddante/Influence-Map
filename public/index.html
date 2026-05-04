@@ -29,7 +29,7 @@
           </label>
           <label class="dev-only">
             <span>Auto budget</span>
-            <input id="auto-budget" type="number" min="1" max="500" value="25">
+            <input id="auto-budget" type="number" min="1" max="10" value="3">
           </label>
           <button id="auto-expand" class="dev-only" type="button">Auto expand frontier</button>
           <button id="reset-graph" class="dev-only" type="button">Reset</button>
@@ -122,7 +122,7 @@
           <section class="panel-page dev-only" data-panel-page="dedupe" hidden>
             <h2>Identity Review</h2>
             <div class="details identity-review-panel">
-              <p class="identity-review-copy">Expansion automatically asks DeepSeek to judge nearby merge, split, and keep-separate cases. Review queued changes here before they alter the graph.</p>
+              <p class="identity-review-copy">Expansion automatically asks the model to handle nearby merges, renames, splits, and keep-separate cases. This panel is now mainly an audit and fallback for anything automatic handling could not safely apply.</p>
               <details class="identity-sweep">
                 <summary>Advanced sweep</summary>
                 <p>Runs a broader duplicate scan across the current database. Use this occasionally, not as the normal workflow.</p>
@@ -134,7 +134,7 @@
                 <button type="button" data-identity-filter="split" aria-pressed="false">Splits <span>0</span></button>
                 <button type="button" data-identity-filter="identity" aria-pressed="false">Checks <span>0</span></button>
               </div>
-              <div id="dedupe-output" class="dedupe-output">Identity decisions from expansion wait here until a dev approves or rejects them.</div>
+              <div id="dedupe-output" class="dedupe-output">Automatic identity handling is on. Unresolved fallback decisions appear here only if the system cannot safely apply them.</div>
             </div>
           </section>
           <section class="panel-page dev-only" data-panel-page="diagnostics" hidden>

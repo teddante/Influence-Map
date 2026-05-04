@@ -11,6 +11,7 @@ const state = {
   selected: null,
   devTools: false,
   expanding: new Set(),
+  autoExpanding: false,
   dragging: null,
   hovered: null,
   pan: { x: 0, y: 0 },
@@ -1110,7 +1111,7 @@ function renderDedupeSuggestions(suggestions) {
     updateIdentityFilterButtons([]);
     state.identitySuggestions = [];
     updateOverview();
-    els.dedupeOutput.textContent = "No pending identity decisions.";
+    els.dedupeOutput.textContent = "No unresolved identity decisions. Automatic merge, split, and rename handling is keeping up.";
     return;
   }
   state.identitySuggestions = suggestions;
@@ -1166,6 +1167,12 @@ async function loadDedupeSuggestions() {
   if (!response.ok) throw new Error(payload.error || "Could not load identity decisions");
   state.identitySuggestions = payload.suggestions || [];
   renderDedupeSuggestions(payload.suggestions || []);
+  const autoIdentity = payload.autoIdentity || {};
+  const applied = Number(autoIdentity.applied || 0);
+  const cleared = Number(autoIdentity.clearedChecks || 0);
+  if (applied || cleared) {
+    setStatus(`Automatic identity cleanup handled ${applied} edit${applied === 1 ? "" : "s"} and cleared ${cleared} check${cleared === 1 ? "" : "s"}.`);
+  }
 }
 
 async function decideDedupeSuggestion(id, action) {
@@ -1192,7 +1199,7 @@ async function decideDedupeSuggestion(id, action) {
 }
 
 async function expandEntity(entity, options = {}) {
-  const node = ensureNode(entity);
+  let node = ensureNode(entity);
   if (!node) return;
   if (state.expanding.has(node.id)) return;
   if (state.expanding.size && !options.allowConcurrent) {
@@ -1251,6 +1258,10 @@ async function expandEntity(entity, options = {}) {
     window.clearTimeout(verySlowProviderTimer);
     slowProviderTimer = 0;
     verySlowProviderTimer = 0;
+    if (payload.graph) {
+      hydrateGraph(payload.graph);
+      node = ensureNode(payload.data && payload.data.entity ? payload.data.entity : entity) || ensureNode(entity);
+    }
     if (payload.debugPrompt) updateActivity(activityId, { prompt: payload.debugPrompt });
     if (payload.identity) {
       const identityPercent = Math.round(Number(payload.identity.confidence || 0) * 100);
@@ -1308,6 +1319,9 @@ async function expandEntity(entity, options = {}) {
       + Number(payload.localHygieneSuggestions || 0)
       + Number(payload.llmHygieneSuggestions || 0);
     const identityDetail = queuedReviews ? ` ${queuedReviews} identity review${queuedReviews === 1 ? "" : "s"} queued.` : "";
+    const autoIdentityDetail = Number(payload.autoIdentityApplied || 0)
+      ? ` ${Number(payload.autoIdentityApplied)} identity edit${Number(payload.autoIdentityApplied) === 1 ? "" : "s"} auto-applied.`
+      : "";
     const resolvedDetail = payload.identity && payload.identity.canonicalName !== node.name
       ? ` Identity checked as ${payload.identity.canonicalName}.`
       : "";
@@ -1320,7 +1334,7 @@ async function expandEntity(entity, options = {}) {
       status: "done",
       title: resultTitle,
       slow: providerMs >= SLOW_LLM_MS,
-      detail: `${resultDetail}${resolvedDetail}${identityDetail}${hygieneDetail}${providerDetail}${timingDetail ? ` Timing: ${timingDetail}.` : ""}`,
+      detail: `${resultDetail}${resolvedDetail}${autoIdentityDetail}${identityDetail}${hygieneDetail}${providerDetail}${timingDetail ? ` Timing: ${timingDetail}.` : ""}`,
       stages: []
     });
     setStatus(shapeChanged
@@ -1380,23 +1394,42 @@ function getFrontier() {
 }
 
 async function autoExpandFrontier() {
-  const budget = Math.max(1, Number(els.autoBudget.value) || 1);
+  if (state.autoExpanding) {
+    setStatus("Auto frontier expansion is already running.");
+    return;
+  }
+  const budget = Math.max(1, Math.min(10, Number(els.autoBudget.value) || 1));
+  els.autoBudget.value = String(budget);
+  const confirmed = window.confirm(`Auto expand frontier will make up to ${budget} model request${budget === 1 ? "" : "s"}. Continue?`);
+  if (!confirmed) {
+    setStatus("Auto frontier expansion cancelled.");
+    return;
+  }
+  state.autoExpanding = true;
+  els.autoExpand.disabled = true;
+  els.autoExpand.textContent = "Auto expanding...";
   const queued = getFrontier().slice(0, budget).map(node => ({
     node,
     activityId: addActivity("expand", `Expand ${node.name}`, "Queued by auto frontier", "queued")
   }));
-  if (!queued.length) {
-    setStatus("Frontier is empty.");
-    return;
-  }
-  for (let i = 0; i < budget; i += 1) {
-    const queuedItem = queued[i];
-    const next = queuedItem ? queuedItem.node : getFrontier()[0];
-    if (!next) {
+  try {
+    if (!queued.length) {
       setStatus("Frontier is empty.");
       return;
     }
-    await expandEntity(next.name, { activityId: queuedItem && queuedItem.activityId });
+    for (let i = 0; i < budget; i += 1) {
+      const queuedItem = queued[i];
+      const next = queuedItem ? queuedItem.node : getFrontier()[0];
+      if (!next) {
+        setStatus("Frontier is empty.");
+        return;
+      }
+      await expandEntity(next.name, { activityId: queuedItem && queuedItem.activityId });
+    }
+  } finally {
+    state.autoExpanding = false;
+    els.autoExpand.disabled = false;
+    els.autoExpand.textContent = "Auto expand frontier";
   }
 }
 
@@ -1817,6 +1850,11 @@ els.tableBody.addEventListener("click", event => {
 
 els.autoExpand.addEventListener("click", () => {
   autoExpandFrontier().catch(error => setStatus(error.message));
+});
+
+els.autoExpand.addEventListener("contextmenu", event => {
+  event.preventDefault();
+  setStatus("Auto frontier expansion needs a normal click and confirmation.");
 });
 
 els.dedupeReview.addEventListener("click", async () => {
