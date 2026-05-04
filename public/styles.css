@@ -496,16 +496,149 @@ h2 {
   margin-top: 9px;
 }
 
+.identity-review-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.identity-review-copy,
+.identity-sweep p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.identity-sweep {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfbf8;
+}
+
+.identity-sweep summary {
+  padding: 9px 10px;
+  color: var(--accent);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.identity-sweep p {
+  padding: 0 10px 9px;
+}
+
+.identity-sweep button {
+  width: calc(100% - 20px);
+  margin: 0 10px 10px;
+  min-height: 34px;
+}
+
+.identity-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.identity-filters button {
+  display: flex;
+  justify-content: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  color: var(--accent);
+  background: #ffffff;
+}
+
+.identity-filters button[aria-pressed="true"] {
+  color: #ffffff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.identity-filters span {
+  color: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.identity-empty {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  background: #fbfbf8;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 .dedupe-group {
   display: grid;
-  gap: 6px;
-  padding: 10px 0 0;
-  border-top: 1px solid var(--line);
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #ffffff;
 }
 
 .dedupe-group span {
   color: var(--muted);
   font-size: 12px;
+}
+
+.review-heading {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px;
+  align-items: center;
+}
+
+.review-heading span {
+  padding: 3px 6px;
+  border-radius: 999px;
+  color: #ffffff;
+  background: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.dedupe-group.split .review-heading span {
+  background: #b4472f;
+}
+
+.dedupe-group.identity .review-heading span {
+  background: #66706d;
+}
+
+.review-heading strong {
+  color: var(--ink);
+}
+
+.review-summary {
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.review-transform {
+  display: grid;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fbfbf8;
+}
+
+.review-transform span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.review-transform strong {
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.35;
 }
 
 .move-candidates {

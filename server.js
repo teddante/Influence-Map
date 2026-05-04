@@ -370,7 +370,7 @@ function mergeNodes(canonical, entities) {
   }
 
   const rows = nodeRowsByIds([canonicalId, ...entityIds]);
-  if (rows.length < 2) throw new Error("Not enough matching nodes remain to merge");
+  if (rows.length < 2) return { changed: false, reason: "Already resolved; fewer than two matching nodes remain" };
 
   const timestamp = nowIso();
   const aliases = new Set([canonicalName]);
@@ -420,6 +420,10 @@ function mergeNodes(canonical, entities) {
     timestamp,
     canonicalId
   );
+  return {
+    changed: Boolean(idsToMove.length),
+    reason: idsToMove.length ? `Merged ${idsToMove.length} node${idsToMove.length === 1 ? "" : "s"}` : "Already canonical"
+  };
 }
 
 function approveSplitSuggestion(suggestion) {
@@ -428,22 +432,35 @@ function approveSplitSuggestion(suggestion) {
   const ids = Array.isArray(metadata.moveObservationIds)
     ? metadata.moveObservationIds.map(Number).filter(Number.isFinite)
     : [];
-  if (!ids.length) return 0;
+  if (!ids.length) return { changed: false, moved: 0, reason: "No movable links were attached to this split review" };
 
-  const canonicalId = upsertNode(parsed.canonical);
   const sourceId = keyFor(parsed.entities[0]);
-  if (!canonicalId || !sourceId || canonicalId === sourceId) return 0;
+  const canonicalKey = keyFor(parsed.canonical);
+  const sourceRow = sourceId ? db.prepare("SELECT * FROM nodes WHERE id = ?").get(sourceId) : null;
+  const canonicalExists = canonicalKey ? db.prepare("SELECT id FROM nodes WHERE id = ?").get(canonicalKey) : null;
+  const canonicalId = upsertNode(parsed.canonical, canonicalExists ? {} : {
+    x: sourceRow ? Number(sourceRow.x) + 36 : 0,
+    y: sourceRow ? Number(sourceRow.y) + 36 : 0
+  });
+  if (!canonicalId || !sourceId || canonicalId === sourceId) return { changed: false, moved: 0, reason: "Split target is already the source node" };
 
   const updateFrom = db.prepare("UPDATE observations SET from_id = ? WHERE id = ? AND from_id = ?");
   const updateTo = db.prepare("UPDATE observations SET to_id = ? WHERE id = ? AND to_id = ?");
+  const updateSource = db.prepare("UPDATE observations SET source_entity = ? WHERE id = ? AND lower(source_entity) = lower(?)");
   let moved = 0;
   for (const id of ids) {
     const fromResult = updateFrom.run(canonicalId, id, sourceId);
     const toResult = updateTo.run(canonicalId, id, sourceId);
-    moved += fromResult.changes + toResult.changes;
+    const changes = fromResult.changes + toResult.changes;
+    if (changes) updateSource.run(parsed.canonical, id, parsed.entities[0]);
+    moved += changes;
   }
   db.prepare("DELETE FROM observations WHERE from_id = to_id").run();
-  return moved;
+  return {
+    changed: moved > 0,
+    moved,
+    reason: moved > 0 ? `Moved ${moved} link${moved === 1 ? "" : "s"}` : "Already resolved; no listed links still belong to the source node"
+  };
 }
 
 function graphFromDb() {
@@ -483,7 +500,10 @@ function writeGraphToDb(data) {
   try {
     db.exec("BEGIN");
     db.exec("DELETE FROM observations; DELETE FROM nodes;");
+    const touchedNames = new Set();
     for (const node of graph.nodes) {
+      touchedNames.add(node.name);
+      for (const alias of node.aliases || []) touchedNames.add(alias);
       upsertNode(node.name, {
         aliases: node.aliases,
         x: node.x,
@@ -499,6 +519,9 @@ function writeGraphToDb(data) {
       const fromId = upsertNode(observation.from);
       const toId = upsertNode(observation.to);
       if (!fromId || !toId || fromId === toId) continue;
+      touchedNames.add(observation.from);
+      touchedNames.add(observation.to);
+      if (observation.sourceEntity) touchedNames.add(observation.sourceEntity);
       insertObservation.run(
         fromId,
         toId,
@@ -514,6 +537,7 @@ function writeGraphToDb(data) {
     setSetting("zoom", graph.zoom);
     setSetting("minConfidence", graph.minConfidence);
     db.exec("COMMIT");
+    localIdentityHygiene([...touchedNames]);
   } catch (error) {
     db.exec("ROLLBACK");
     throw error;
@@ -607,6 +631,8 @@ function buildInfluenceMessages(entity, context = {}) {
     "If the user gives lowercase, slang, initials, or a partial title, put the official commonly recognized name in entity.",
     "If the requested name is ambiguous, use the supplied local graph context to choose the intended entity sense.",
     "If a bare name could mean multiple entities, disambiguate the entity field with a concise parenthetical qualifier such as medium, year, role, or domain.",
+    "For works with likely title ambiguity, prefer concise year plus medium disambiguation such as \"The Shining (1980 film)\" or \"Quake (1996 video game)\".",
+    "Do not add years to people, bands, movements, genres, or uniquely named entities unless the year is part of the recognized name.",
     "Prefer discoveredFrom context over earlier expansion results when the two conflict, because discoveredFrom describes why the node entered the graph.",
     "Do not switch to a broader generic concept just because the bare text is common; keep the specific contextual entity.",
     "Use context only to identify the intended entity sense; do not limit the output to the supplied context.",
@@ -728,6 +754,7 @@ function buildIdentityMessages(entity, context = {}) {
     "Do not decide influence relationships here.",
     "Do not merge series/franchises with individual works, adaptations with sources, sequels with originals, or broad concepts with specific entities.",
     "When a bare title likely means a specific work, use a concise Wikipedia-style disambiguated canonicalName.",
+    "For ambiguous works, prefer year plus medium in canonicalName when commonly known, but do not add years to people, bands, genres, or movements.",
     "If unsure, use decision uncertain and keep the most literal canonicalName."
   ].join(" ");
   const user = JSON.stringify({
@@ -918,6 +945,93 @@ async function callDedupeReview(candidates) {
   };
 }
 
+function scopedDedupeCandidates(names = []) {
+  const touched = new Set((names || []).map(keyFor).filter(Boolean));
+  if (!touched.size) return [];
+  return dedupeCandidatesFromDb(5000)
+    .filter(candidate => (candidate.entities || []).some(name => touched.has(keyFor(name))))
+    .slice(0, 12);
+}
+
+function buildScopedIdentityMessages(names, candidates) {
+  const compactCandidates = (candidates || []).slice(0, 12).map(candidate => ({
+    reason: candidate.reason,
+    entities: (candidate.entities || []).slice(0, 6)
+  }));
+  const system = [
+    "You adjudicate identity hygiene for an influence graph as strict json.",
+    "Return only this JSON shape:",
+    "{\"groups\":[{\"action\":\"merge|split|keep-separate\",\"canonical\":\"Name\",\"entities\":[\"Name\"],\"confidence\":0.0,\"reason\":\"short reason\"}]}",
+    "Use merge only when all entities are the same exact real entity or title.",
+    "Use split when a bare or ambiguous entity appears to contain observations for a different specific sense.",
+    "Use keep-separate for franchises vs individual works, adaptations vs sources, sequels vs originals, broad concepts vs specific entities, and shared names that are different things.",
+    "Prefer no group over a weak group.",
+    "Keep reasons short."
+  ].join(" ");
+  const user = JSON.stringify({
+    touchedEntities: [...new Set((names || []).map(normalizeName).filter(Boolean))].slice(0, 40),
+    heuristicCandidates: compactCandidates
+  });
+  return {
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user }
+    ],
+    candidates: compactCandidates
+  };
+}
+
+function sanitizeScopedIdentityGroups(groups) {
+  return (Array.isArray(groups) ? groups : [])
+    .map(group => {
+      const action = normalizeName(group.action).toLowerCase();
+      return {
+        action: ["merge", "split", "keep-separate"].includes(action) ? action : "keep-separate",
+        canonical: normalizeName(group.canonical),
+        entities: Array.isArray(group.entities) ? group.entities.map(normalizeName).filter(Boolean).slice(0, 8) : [],
+        confidence: clampConfidence(group.confidence),
+        reason: normalizeName(group.reason)
+      };
+    })
+    .filter(group => group.canonical && group.entities.length > 1 && group.confidence >= 0.6);
+}
+
+async function callScopedIdentityReview(names, candidates) {
+  const prompt = buildScopedIdentityMessages(names, candidates);
+  if (!DEEPSEEK_API_KEY || !candidates.length) {
+    return { groups: [], prompt };
+  }
+
+  const response = await fetch(`${DEEPSEEK_BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${DEEPSEEK_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: DEEPSEEK_MODEL,
+      messages: prompt.messages,
+      response_format: { type: "json_object" },
+      temperature: 0.1,
+      max_tokens: 900
+    })
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`DeepSeek identity hygiene ${response.status}: ${text.slice(0, 500)}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  if (!content) return { groups: [], prompt };
+  const parsed = JSON.parse(content);
+  return {
+    groups: sanitizeScopedIdentityGroups(parsed.groups),
+    prompt
+  };
+}
+
 function suggestionKey(entities) {
   return [...new Set((entities || []).map(keyFor).filter(Boolean))].sort().join("|");
 }
@@ -1058,20 +1172,149 @@ function canonicalFromNames(names) {
   return sorted[0] || names[0] || "";
 }
 
+function identityKind(name) {
+  const key = keyFor(name);
+  const kinds = new Set();
+  if (/\bfilm\b|\bmovie\b/.test(key)) kinds.add("film");
+  if (/\bvideo game\b|\bgame\b/.test(key)) kinds.add("game");
+  if (/\bseries\b|\bfranchise\b/.test(key)) kinds.add("series");
+  if (/\balbum\b/.test(key)) kinds.add("album");
+  if (/\bnovel\b|\bbook\b/.test(key)) kinds.add("book");
+  if (/\bband\b/.test(key)) kinds.add("band");
+  if (/\btv\b|\btelevision\b/.test(key)) kinds.add("television");
+  return kinds;
+}
+
+function identityYears(name) {
+  return [...keyFor(name).matchAll(/\b(19|20)\d{2}\b/g)].map(match => match[0]);
+}
+
+function compatibleTitleVariants(names) {
+  const clean = (names || []).map(normalizeName).filter(Boolean);
+  if (clean.length < 2) return false;
+  const base = baseTitleKey(clean[0]);
+  if (!base || clean.some(name => baseTitleKey(name) !== base)) return false;
+
+  const yearSets = clean.map(identityYears).filter(years => years.length);
+  const years = new Set(yearSets.flat());
+  if (yearSets.length > 1 && years.size > 1) return false;
+
+  const kindSets = clean.map(identityKind);
+  const explicitKinds = kindSets.filter(set => set.size);
+  if (!explicitKinds.length) return false;
+  const allKinds = new Set(explicitKinds.flatMap(set => [...set]));
+  if (allKinds.has("series") && allKinds.size > 1) return false;
+
+  const compatiblePairs = [
+    ["film"],
+    ["game"],
+    ["album"],
+    ["book"],
+    ["band"],
+    ["television"]
+  ];
+  return compatiblePairs.some(group => {
+    const allowed = new Set(group);
+    return explicitKinds.every(set => [...set].every(kind => allowed.has(kind)));
+  });
+}
+
 function localDedupeSuggestions(candidates) {
   const trustedReasons = new Set([
     "same compact punctuation-free form",
-    "exact acronym-name match"
+    "exact acronym-name match",
+    "same base title with compatible disambiguators"
   ]);
   return (candidates || [])
-    .filter(candidate => trustedReasons.has(candidate.reason))
+    .filter(candidate => trustedReasons.has(candidate.reason)
+      || (candidate.reason === "same base title with disambiguator" && compatibleTitleVariants(candidate.entities)))
     .map(candidate => ({
       canonical: canonicalFromNames(candidate.entities || []),
       entities: candidate.entities || [],
-      confidence: 0.72,
+      confidence: candidate.reason.includes("base title") ? 0.68 : 0.72,
       reason: `Local heuristic: ${candidate.reason}`
     }))
     .filter(group => group.canonical && group.entities.length > 1);
+}
+
+function targetedTitleVariantCandidates(names = []) {
+  const touched = new Set((names || []).map(keyFor).filter(Boolean));
+  if (!touched.size) return [];
+  const nodes = db.prepare("SELECT id, name FROM nodes ORDER BY name COLLATE NOCASE").all();
+  const byBase = new Map();
+  for (const node of nodes) {
+    const base = baseTitleKey(node.name);
+    if (!base || !hasDisambiguator(node.name)) continue;
+    const bucket = byBase.get(base) || [];
+    bucket.push(node);
+    byBase.set(base, bucket);
+  }
+
+  const groups = new Map();
+  for (const bucket of byBase.values()) {
+    for (let i = 0; i < bucket.length; i += 1) {
+      for (let j = i + 1; j < bucket.length; j += 1) {
+        const a = bucket[i];
+        const b = bucket[j];
+        if (!touched.has(a.id) && !touched.has(b.id)) continue;
+        if (!compatibleTitleVariants([a.name, b.name])) continue;
+        const entities = [a.name, b.name];
+        const key = suggestionKey(entities);
+        if (!groups.has(key)) {
+          groups.set(key, {
+            reason: "same base title with compatible disambiguators",
+            entities
+          });
+        }
+      }
+    }
+  }
+  return [...groups.values()];
+}
+
+function localIdentityHygiene(names = []) {
+  try {
+    const touched = new Set((names || []).map(keyFor).filter(Boolean));
+    const candidates = dedupeCandidatesFromDb(5000);
+    const scoped = touched.size
+      ? candidates.filter(candidate => (candidate.entities || []).some(name => touched.has(keyFor(name))))
+      : candidates;
+    return storeDedupeSuggestions(localDedupeSuggestions([
+      ...scoped,
+      ...targetedTitleVariantCandidates(names)
+    ]));
+  } catch (error) {
+    console.warn(`Local identity hygiene skipped: ${error.message}`);
+    return 0;
+  }
+}
+
+function namesFromInfluenceResponse(entity, data) {
+  return [
+    entity,
+    data && data.entity,
+    ...((data && data.influencedBy) || []).map(item => item.entity),
+    ...((data && data.influenced) || []).map(item => item.entity)
+  ].map(normalizeName).filter(Boolean);
+}
+
+function storeScopedIdentityGroups(groups) {
+  const actionable = [];
+  for (const group of groups || []) {
+    if (group.action === "keep-separate") continue;
+    actionable.push({
+      canonical: group.canonical,
+      entities: group.entities,
+      confidence: group.confidence,
+      action: group.action === "split" ? "identity" : "merge",
+      metadata: {
+        llmAction: group.action,
+        automatedReview: true
+      },
+      reason: `LLM scoped identity: ${group.reason || group.action}`
+    });
+  }
+  return storeDedupeSuggestions(actionable);
 }
 
 function acronymFor(name) {
@@ -1122,7 +1365,7 @@ function tokenOverlapScore(a, b) {
   return shared / Math.min(aTokens.size, bTokens.size);
 }
 
-function dedupeCandidatesFromDb() {
+function dedupeCandidatesFromDb(limit = 500) {
   const nodes = db.prepare("SELECT id, name, aliases FROM nodes ORDER BY name COLLATE NOCASE").all()
     .map(row => ({
       id: row.id,
@@ -1180,12 +1423,19 @@ function dedupeCandidatesFromDb() {
       if (isAcronymLike(a.name) && acronymFor(b.name) === a.id) add("exact acronym-name match", [a, b]);
       if (isAcronymLike(b.name) && acronymFor(a.name) === b.id) add("exact acronym-name match", [a, b]);
       if (tokenOverlapScore(a.name, b.name) >= 0.8) add("high token overlap", [a, b]);
+      if (hasDisambiguator(a.name)
+        && hasDisambiguator(b.name)
+        && baseTitleKey(a.name) === baseTitleKey(b.name)
+        && compatibleTitleVariants([a.name, b.name])) {
+        add("same base title with compatible disambiguators", [a, b]);
+      }
       if (hasDisambiguator(a.name) && baseTitleKey(a.name) === b.id) add("same base title with disambiguator", [a, b]);
       if (hasDisambiguator(b.name) && baseTitleKey(b.name) === a.id) add("same base title with disambiguator", [a, b]);
     }
   }
 
-  return [...groups.values()].slice(0, 90);
+  const values = [...groups.values()];
+  return Number.isFinite(limit) ? values.slice(0, limit) : values;
 }
 
 async function handleApiInfluences(req, res) {
@@ -1222,19 +1472,31 @@ async function handleApiInfluences(req, res) {
     }
 
     const result = await callDeepSeek(generationEntity, context);
+    const touchedNames = namesFromInfluenceResponse(entity, result.data);
+    const scopedCandidates = scopedDedupeCandidates(touchedNames);
+    const scopedReview = await callScopedIdentityReview(touchedNames, scopedCandidates);
     const identitySuggestions = storeExpansionIdentitySuggestion(entity, result.data.entity, context);
+    const llmHygieneSuggestions = storeScopedIdentityGroups(scopedReview.groups);
+    const localHygieneSuggestions = localIdentityHygiene(touchedNames);
     const response = {
       provider: "deepseek",
       model: DEEPSEEK_MODEL,
       data: result.data,
       identity: identityResult ? identityResult.data : null,
       identityCandidates: identityPlan.candidates,
-      identitySuggestions
+      scopedIdentityReview: {
+        candidates: scopedCandidates.length,
+        groups: scopedReview.groups
+      },
+      identitySuggestions,
+      llmHygieneSuggestions,
+      localHygieneSuggestions
     };
     if (hasAdminAccess(req, new URL(req.url, `http://${req.headers.host}`))) {
       response.debugPrompt = buildPromptBundle({
         identity: identityResult && identityResult.prompt,
-        expansion: result.prompt
+        expansion: result.prompt,
+        hygiene: scopedReview.prompt
       });
     }
     return sendJson(res, 200, response);
@@ -1341,16 +1603,21 @@ async function handleApiDedupeDecision(req, res, url, id, decision) {
     if (suggestion.status !== "pending") return sendJson(res, 409, { error: "Suggestion has already been reviewed" });
 
     const timestamp = nowIso();
+    let decisionResult = { changed: false, reason: decision === "approve" ? "Marked reviewed" : "Rejected" };
     if (decision === "approve") {
       db.exec("BEGIN");
+      let touchedNames = [];
       try {
         const parsed = rowToSuggestion(suggestion);
+        touchedNames = [parsed.canonical, ...parsed.entities];
         if (parsed.action === "merge") {
-          mergeNodes(parsed.canonical, parsed.entities);
+          decisionResult = mergeNodes(parsed.canonical, parsed.entities);
           setSetting("savedAt", timestamp);
         } else if (parsed.action === "split") {
-          approveSplitSuggestion(suggestion);
+          decisionResult = approveSplitSuggestion(suggestion);
           setSetting("savedAt", timestamp);
+        } else {
+          decisionResult = { changed: false, reason: "Identity check marked reviewed" };
         }
         db.prepare(`
           UPDATE dedupe_suggestions
@@ -1358,6 +1625,7 @@ async function handleApiDedupeDecision(req, res, url, id, decision) {
           WHERE id = ?
         `).run(timestamp, timestamp, id);
         db.exec("COMMIT");
+        localIdentityHygiene(touchedNames);
       } catch (error) {
         db.exec("ROLLBACK");
         throw error;
@@ -1372,7 +1640,8 @@ async function handleApiDedupeDecision(req, res, url, id, decision) {
 
     sendJson(res, 200, {
       suggestions: pendingDedupeSuggestions(),
-      data: graphFromDb()
+      data: graphFromDb(),
+      result: decisionResult
     });
   } catch (error) {
     sendJson(res, 500, { error: error.message || "Dedupe decision failed" });

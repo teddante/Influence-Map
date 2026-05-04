@@ -53,7 +53,7 @@
           <div class="panel-tabs" aria-label="Panel sections">
             <button type="button" data-panel-tab="selected" aria-pressed="true">Selected</button>
             <button type="button" data-panel-tab="activity" aria-pressed="false">Activity</button>
-            <button type="button" data-panel-tab="dedupe" aria-pressed="false" class="dev-only">Dedupe</button>
+            <button type="button" data-panel-tab="dedupe" aria-pressed="false" class="dev-only">Identity</button>
             <button type="button" data-panel-tab="guide" aria-pressed="false">Guide</button>
           </div>
           <section class="panel-page" data-panel-page="selected">
@@ -101,10 +101,21 @@
             </div>
           </section>
           <section class="panel-page dev-only" data-panel-page="dedupe" hidden>
-            <h2>Dedupe Review</h2>
-            <div class="details">
-              <button id="dedupe-review" type="button">Review possible duplicates</button>
-              <div id="dedupe-output" class="dedupe-output">DeepSeek suggestions wait here until a dev approves or rejects each merge.</div>
+            <h2>Identity Review</h2>
+            <div class="details identity-review-panel">
+              <p class="identity-review-copy">Expansion automatically asks DeepSeek to judge nearby merge, split, and keep-separate cases. Review queued changes here before they alter the graph.</p>
+              <details class="identity-sweep">
+                <summary>Advanced sweep</summary>
+                <p>Runs a broader duplicate scan across the current database. Use this occasionally, not as the normal workflow.</p>
+                <button id="dedupe-review" type="button">Run full identity sweep</button>
+              </details>
+              <div class="identity-filters" aria-label="Identity decision filters">
+                <button type="button" data-identity-filter="all" aria-pressed="true">All <span>0</span></button>
+                <button type="button" data-identity-filter="merge" aria-pressed="false">Merges <span>0</span></button>
+                <button type="button" data-identity-filter="split" aria-pressed="false">Splits <span>0</span></button>
+                <button type="button" data-identity-filter="identity" aria-pressed="false">Checks <span>0</span></button>
+              </div>
+              <div id="dedupe-output" class="dedupe-output">Identity decisions from expansion wait here until a dev approves or rejects them.</div>
             </div>
           </section>
         </aside>

@@ -25,6 +25,8 @@ const state = {
   tableSort: "popularity",
   tableDirection: "desc",
   tableFilter: "",
+  identityFilter: "all",
+  identitySuggestions: [],
   panelTab: "selected",
   activities: [],
   activityCounter: 0
@@ -56,6 +58,7 @@ const els = {
   selectedDetails: document.querySelector("#selected-details"),
   dedupeReview: document.querySelector("#dedupe-review"),
   dedupeOutput: document.querySelector("#dedupe-output"),
+  identityFilters: document.querySelectorAll("[data-identity-filter]"),
   panelTabs: document.querySelectorAll("[data-panel-tab]"),
   panelPages: document.querySelectorAll("[data-panel-page]"),
   promptModal: document.querySelector("#prompt-modal"),
@@ -569,7 +572,7 @@ function renderPromptStage(prompt, stage, title) {
         <div><span>Entity</span><strong>${escapeHtml(payload.entity || "")}</strong></div>
       ` : ""}
       ${isDedupe ? `
-        <div><span>Task</span><strong>Dedupe review</strong></div>
+        <div><span>Task</span><strong>Identity review</strong></div>
         <div><span>Candidate groups</span><strong>${Array.isArray(payload.candidates) ? payload.candidates.length : 0}</strong></div>
       ` : ""}
       ${isIdentity ? `
@@ -597,7 +600,7 @@ function renderPromptStage(prompt, stage, title) {
     ` : ""}
     ${isDedupe ? `
       <section class="prompt-section">
-        <h3>Dedupe Candidates</h3>
+        <h3>Identity Candidates</h3>
         <p class="prompt-muted">${Array.isArray(payload.entityNames) ? payload.entityNames.length : 0} entity names were included for context.</p>
         ${contextRows((payload.candidates || []).slice(0, 20).map(candidate => ({
           entity: (candidate.entities || []).join(", "),
@@ -618,7 +621,11 @@ function renderPromptView(prompt) {
   if (!promptText) return "";
   const stages = prompt && prompt.stages ? Object.keys(prompt.stages) : [];
   const stageHtml = stages.length
-    ? stages.map(stage => renderPromptStage({ messages: prompt.stages[stage].messages }, "", stage === "identity" ? "Identity Resolution" : "Influence Expansion")).join("")
+    ? stages.map(stage => renderPromptStage(
+      { messages: prompt.stages[stage].messages },
+      "",
+      stage === "identity" ? "Identity Resolution" : stage === "hygiene" ? "Identity Hygiene" : "Influence Expansion"
+    )).join("")
     : renderPromptStage(prompt, "", "Model Prompt");
   const payload = parsedUserPayload(prompt);
 
@@ -850,37 +857,100 @@ async function fetchInfluencePrompt(entity, context = {}) {
   return payload.debugPrompt || null;
 }
 
+function reviewExplanation(item) {
+  const entities = (item.entities || []).map(displayName).filter(Boolean);
+  const canonical = displayName(item.canonical || entities[0] || "");
+  const source = entities.find(name => keyFor(name) !== keyFor(canonical)) || entities[0] || "";
+  if (item.action === "merge") {
+    return {
+      title: `Merge into ${canonical}`,
+      badge: "Merge",
+      approveLabel: "Merge these nodes",
+      summary: "These names appear to describe the same thing.",
+      change: `Approving will replace the listed nodes with one node named "${canonical}". All observations and edges from the other names move onto that node.`,
+      reject: "Reject if these are related but different things, such as a franchise and one game, a remake and an original, or a shared acronym."
+    };
+  }
+  if (item.action === "split") {
+    return {
+      title: `Split from ${source || canonical}`,
+      badge: "Split",
+      approveLabel: "Move selected links",
+      summary: "Some links on one ambiguous node may belong to a more specific node.",
+      change: `Approving will create or use "${canonical}" and move only the listed links there. It will not merge the whole "${source || "source"}" node.`,
+      reject: "Reject if those links should stay on the current node."
+    };
+  }
+  return {
+    title: `Check ${canonical}`,
+    badge: "Check",
+    approveLabel: "Mark reviewed",
+    summary: "The model noticed a naming or identity signal, but it is not proposing a graph edit.",
+    change: "Approving only marks this review as handled. It does not rename, merge, split, or move anything.",
+    reject: "Reject if this signal is not useful."
+  };
+}
+
+function identityActionFor(item) {
+  return item.action === "merge" || item.action === "split" ? item.action : "identity";
+}
+
+function updateIdentityFilterButtons(suggestions) {
+  const counts = { all: suggestions.length, merge: 0, split: 0, identity: 0 };
+  for (const item of suggestions) counts[identityActionFor(item)] += 1;
+  els.identityFilters.forEach(button => {
+    const filter = button.getAttribute("data-identity-filter");
+    button.setAttribute("aria-pressed", String(filter === state.identityFilter));
+    const count = button.querySelector("span");
+    if (count) count.textContent = String(counts[filter] || 0);
+  });
+}
+
 function renderDedupeSuggestions(suggestions) {
   if (!els.dedupeOutput) return;
   if (!suggestions || !suggestions.length) {
-    els.dedupeOutput.textContent = "No pending duplicate suggestions.";
+    updateIdentityFilterButtons([]);
+    els.dedupeOutput.textContent = "No pending identity decisions.";
     return;
   }
-  els.dedupeOutput.innerHTML = suggestions.map(item => {
-    const isMerge = item.action === "merge";
-    const isSplit = item.action === "split";
+  updateIdentityFilterButtons(suggestions);
+  const visible = state.identityFilter === "all"
+    ? suggestions
+    : suggestions.filter(item => identityActionFor(item) === state.identityFilter);
+  if (!visible.length) {
+    els.dedupeOutput.innerHTML = `
+      <div class="identity-empty">
+        No pending ${escapeHtml(state.identityFilter)} decisions. Splits only appear when the system has specific links it can safely move; checks appear when the model raises a signal without proposing a graph edit.
+      </div>
+    `;
+    return;
+  }
+  els.dedupeOutput.innerHTML = visible.map(item => {
     const moveCandidates = item.metadata && Array.isArray(item.metadata.moveCandidates) ? item.metadata.moveCandidates : [];
-    const title = isMerge ? item.canonical : isSplit ? "Split review" : "Identity review";
-    const approveLabel = isMerge ? "Approve merge" : isSplit ? "Approve split" : "Mark reviewed";
-    const reviewText = isMerge
-      ? "Only approve if every listed name is the same real entity. Reject if this is a related topic, parent series, sequel, adaptation, shared acronym, broad category, or a different sense that should stay separate."
-      : isSplit
-        ? "Approving moves only the listed context-linked observations to the resolved entity. It does not merge the whole node."
-        : "This is a model identity/canonicalization signal. Approving records the review only; it does not merge nodes. Use it to decide whether a future merge, rename, or split tool should be applied.";
+    const review = reviewExplanation(item);
     return `
-    <div class="dedupe-group" data-suggestion="${item.id}">
-      <strong>${escapeHtml(title)}</strong>
-      <div>${escapeHtml(item.entities.join(", "))}</div>
-      <span>${Math.round(Number(item.confidence || 0) * 100)}% - ${escapeHtml(item.reason || "Possible duplicate")}</span>
+    <div class="dedupe-group ${escapeHtml(item.action || "identity")}" data-suggestion="${item.id}">
+      <div class="review-heading">
+        <span>${escapeHtml(review.badge)}</span>
+        <strong>${escapeHtml(review.title)}</strong>
+      </div>
+      <p class="review-summary">${escapeHtml(review.summary)}</p>
+      <div class="review-transform">
+        <span>Names involved</span>
+        <strong>${escapeHtml((item.entities || []).join(" + "))}</strong>
+        <span>Result if approved</span>
+        <strong>${escapeHtml(review.change)}</strong>
+      </div>
+      <span>${Math.round(Number(item.confidence || 0) * 100)}% confidence - ${escapeHtml(item.reason || "Identity decision")}</span>
       ${moveCandidates.length ? `<ul class="move-candidates">${moveCandidates.map(candidate => `
         <li>${escapeHtml(candidate.from)} -> ${escapeHtml(candidate.to)} <span>${Math.round(Number(candidate.confidence || 0) * 100)}%</span></li>
       `).join("")}</ul>` : ""}
       <details class="dedupe-review-details">
-        <summary>Review decision</summary>
-        <p>${reviewText}</p>
+        <summary>How to decide</summary>
+        <p>${escapeHtml(review.reject)}</p>
       </details>
       <div class="dedupe-actions">
-        <button type="button" data-dedupe-action="approve" data-id="${item.id}">${approveLabel}</button>
+        <button type="button" data-dedupe-action="approve" data-id="${item.id}">${escapeHtml(review.approveLabel)}</button>
         <button type="button" data-dedupe-action="reject" data-id="${item.id}">Reject</button>
       </div>
     </div>
@@ -891,26 +961,32 @@ function renderDedupeSuggestions(suggestions) {
 async function loadDedupeSuggestions() {
   const response = await fetch("/api/dedupe-suggestions", { headers: adminHeaders() });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Could not load dedupe suggestions");
+  if (!response.ok) throw new Error(payload.error || "Could not load identity decisions");
+  state.identitySuggestions = payload.suggestions || [];
   renderDedupeSuggestions(payload.suggestions || []);
 }
 
 async function decideDedupeSuggestion(id, action) {
-  const activityId = addActivity("dedupe", action === "approve" ? "Approving duplicate merge" : "Rejecting duplicate suggestion", `Suggestion ${id}`, "running");
+  const activityId = addActivity("identity", action === "approve" ? "Approving identity decision" : "Rejecting identity decision", `Suggestion ${id}`, "running");
   const response = await fetch(`/api/dedupe-suggestions/${id}/${action}`, {
     method: "POST",
     headers: adminHeaders()
   });
   const payload = await response.json();
   if (!response.ok) {
-    updateActivity(activityId, { status: "failed", detail: payload.error || "Dedupe decision failed" });
-    throw new Error(payload.error || "Dedupe decision failed");
+    updateActivity(activityId, { status: "failed", detail: payload.error || "Identity decision failed" });
+    throw new Error(payload.error || "Identity decision failed");
   }
   if (payload.data) hydrateGraph(payload.data);
-  renderDedupeSuggestions(payload.suggestions || []);
+  state.identitySuggestions = payload.suggestions || [];
+  renderDedupeSuggestions(state.identitySuggestions);
   updateUi();
-  updateActivity(activityId, { status: "done", detail: action === "approve" ? "Merged into SQLite graph" : "Marked rejected" });
-  setStatus(action === "approve" ? "Merged approved duplicate group." : "Rejected duplicate suggestion.");
+  const result = payload.result || {};
+  const detail = action === "approve"
+    ? (result.reason || (result.changed ? "Applied to SQLite graph" : "Already resolved"))
+    : "Marked rejected";
+  updateActivity(activityId, { status: "done", detail });
+  setStatus(action === "approve" ? detail : "Rejected identity decision.");
 }
 
 async function expandEntity(entity, options = {}) {
@@ -946,7 +1022,7 @@ async function expandEntity(entity, options = {}) {
         detail: `Identity ${payload.identity.decision}: ${payload.identity.canonicalName} (${identityPercent}%), applying expansion`
       });
     }
-    if (payload.identitySuggestions && state.devTools) {
+    if ((payload.identitySuggestions || payload.localHygieneSuggestions || payload.llmHygieneSuggestions) && state.devTools) {
       loadDedupeSuggestions().catch(() => {});
     }
     const data = payload.data;
@@ -991,7 +1067,10 @@ async function expandEntity(entity, options = {}) {
     const resultDetail = shapeChanged
       ? `${payload.provider}/${payload.model} added ${addedObservations} observations, ${addedNodes} entities, ${addedEdges} edges`
       : `${payload.provider}/${payload.model} added ${addedObservations} observation${addedObservations === 1 ? "" : "s"} to existing links; graph shape unchanged`;
-    const identityDetail = payload.identitySuggestions ? " Identity review queued." : "";
+    const queuedReviews = Number(payload.identitySuggestions || 0)
+      + Number(payload.localHygieneSuggestions || 0)
+      + Number(payload.llmHygieneSuggestions || 0);
+    const identityDetail = queuedReviews ? ` ${queuedReviews} identity review${queuedReviews === 1 ? "" : "s"} queued.` : "";
     const resolvedDetail = payload.identity && payload.identity.canonicalName !== node.name
       ? ` Identity checked as ${payload.identity.canonicalName}.`
       : "";
@@ -1439,29 +1518,37 @@ els.autoExpand.addEventListener("click", () => {
 });
 
 els.dedupeReview.addEventListener("click", async () => {
-  const activityId = addActivity("dedupe", "Review possible duplicates", "DeepSeek review in progress", "running");
-  els.dedupeOutput.textContent = "Reviewing likely duplicates and adding suggestions to the approval list...";
+  const activityId = addActivity("identity", "Full identity sweep", "DeepSeek review in progress", "running");
+  els.dedupeOutput.textContent = "Running a broader identity sweep and adding decisions to the approval list...";
   try {
     const response = await fetch("/api/dedupe-review", {
       method: "POST",
       headers: adminHeaders()
     });
     const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Dedupe review failed");
+    if (!response.ok) throw new Error(payload.error || "Identity sweep failed");
     if (payload.debugPrompt) updateActivity(activityId, { prompt: payload.debugPrompt });
     const suggestions = payload.pending || [];
     if (!suggestions.length) {
-      els.dedupeOutput.textContent = `No confident duplicate groups found from ${payload.candidates.length} local candidates.`;
-      updateActivity(activityId, { status: "done", detail: "No confident duplicate groups found" });
+      els.dedupeOutput.textContent = `No confident identity groups found from ${payload.candidates.length} local candidates.`;
+      updateActivity(activityId, { status: "done", detail: "No confident identity groups found" });
       return;
     }
-    renderDedupeSuggestions(suggestions);
-    updateActivity(activityId, { status: "done", detail: `${payload.stored || 0} suggestions added for approval` });
-    setStatus(`Added ${payload.stored || 0} dedupe suggestions for approval.`);
+    state.identitySuggestions = suggestions;
+    renderDedupeSuggestions(state.identitySuggestions);
+    updateActivity(activityId, { status: "done", detail: `${payload.stored || 0} identity decisions added for approval` });
+    setStatus(`Added ${payload.stored || 0} identity decisions for approval.`);
   } catch (error) {
     updateActivity(activityId, { status: "failed", detail: error.message });
     els.dedupeOutput.textContent = error.message;
   }
+});
+
+els.identityFilters.forEach(button => {
+  button.addEventListener("click", () => {
+    state.identityFilter = button.getAttribute("data-identity-filter") || "all";
+    renderDedupeSuggestions(state.identitySuggestions || []);
+  });
 });
 
 els.dedupeOutput.addEventListener("click", event => {
