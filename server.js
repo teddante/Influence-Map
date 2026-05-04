@@ -4,6 +4,7 @@ const path = require("path");
 
 const PORT = Number(process.env.PORT || 3000);
 const PUBLIC_DIR = path.join(__dirname, "public");
+const DATA_FILE = process.env.INFLUENCE_MAP_DATA_FILE || path.join(__dirname, "data", "graph.json");
 const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
 const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
@@ -24,12 +25,12 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 1_000_000) {
   return new Promise((resolve, reject) => {
     let body = "";
     req.on("data", chunk => {
       body += chunk;
-      if (body.length > 1_000_000) {
+      if (body.length > maxBytes) {
         req.destroy();
         reject(new Error("Request body too large"));
       }
@@ -74,6 +75,72 @@ function sanitizeInfluenceResponse(entity, data) {
     influencedBy: sanitizeItems(data && data.influencedBy),
     influenced: sanitizeItems(data && data.influenced)
   };
+}
+
+function finiteNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function sanitizeGraphData(data) {
+  const minConfidence = data && Object.prototype.hasOwnProperty.call(data, "minConfidence")
+    ? clampConfidence(data.minConfidence)
+    : 0.35;
+  const savedAtDate = new Date(data && data.savedAt);
+  const savedAt = Number.isFinite(savedAtDate.valueOf()) ? savedAtDate.toISOString() : new Date().toISOString();
+
+  const nodes = [];
+  const seenNodes = new Set();
+  for (const node of Array.isArray(data && data.nodes) ? data.nodes : []) {
+    const name = normalizeName(node && node.name);
+    const id = keyFor(name);
+    if (!id || seenNodes.has(id)) continue;
+    seenNodes.add(id);
+    nodes.push({
+      id,
+      name,
+      x: finiteNumber(node && node.x, 0),
+      y: finiteNumber(node && node.y, 0)
+    });
+  }
+
+  const observations = [];
+  for (const observation of Array.isArray(data && data.observations) ? data.observations : []) {
+    const from = normalizeName(observation && observation.from);
+    const to = normalizeName(observation && observation.to);
+    if (!from || !to || keyFor(from) === keyFor(to)) continue;
+    observations.push({
+      from,
+      to,
+      confidence: Number(clampConfidence(observation.confidence).toFixed(3))
+    });
+  }
+
+  const expanded = [];
+  const seenExpanded = new Set();
+  for (const name of Array.isArray(data && data.expanded) ? data.expanded : []) {
+    const key = keyFor(name);
+    if (!key || seenExpanded.has(key)) continue;
+    seenExpanded.add(key);
+    expanded.push(key);
+  }
+
+  return {
+    version: 1,
+    savedAt,
+    nodes,
+    observations,
+    expanded,
+    pan: {
+      x: finiteNumber(data && data.pan && data.pan.x, 0),
+      y: finiteNumber(data && data.pan && data.pan.y, 0)
+    },
+    minConfidence
+  };
+}
+
+function keyFor(name) {
+  return normalizeName(name).toLowerCase();
 }
 
 function mockInfluences(entity) {
@@ -218,6 +285,48 @@ async function handleApiInfluences(req, res) {
   }
 }
 
+async function readGraphData() {
+  try {
+    const raw = await fs.promises.readFile(DATA_FILE, "utf8");
+    return sanitizeGraphData(JSON.parse(raw));
+  } catch (error) {
+    if (error.code === "ENOENT") return sanitizeGraphData({});
+    throw error;
+  }
+}
+
+async function writeGraphData(data) {
+  const graph = sanitizeGraphData({
+    ...data,
+    savedAt: new Date().toISOString()
+  });
+  await fs.promises.mkdir(path.dirname(DATA_FILE), { recursive: true });
+  await fs.promises.writeFile(DATA_FILE, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+  return graph;
+}
+
+async function handleApiGraph(req, res) {
+  try {
+    if (req.method === "GET") {
+      return sendJson(res, 200, {
+        data: await readGraphData()
+      });
+    }
+
+    if (req.method === "PUT") {
+      const raw = await readBody(req, 10_000_000);
+      const body = raw ? JSON.parse(raw) : {};
+      return sendJson(res, 200, {
+        data: await writeGraphData(body)
+      });
+    }
+
+    return sendJson(res, 405, { error: "Method not allowed" });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message || "Graph persistence failed" });
+  }
+}
+
 function serveStatic(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname;
@@ -245,8 +354,13 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.method === "POST" && req.url === "/api/influences") {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  if (req.method === "POST" && url.pathname === "/api/influences") {
     handleApiInfluences(req, res);
+    return;
+  }
+  if ((req.method === "GET" || req.method === "PUT") && url.pathname === "/api/graph") {
+    handleApiGraph(req, res);
     return;
   }
   if (req.method === "GET") {

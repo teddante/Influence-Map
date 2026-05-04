@@ -16,6 +16,7 @@ pnpm-debug.log*
 # Runtime output
 .DS_Store
 Thumbs.db
+data/
 
 # Editor files
 .vscode/

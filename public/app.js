@@ -10,7 +10,10 @@ const state = {
   dragging: null,
   pan: { x: 0, y: 0 },
   lastPointer: null,
-  minConfidence: 0.35
+  minConfidence: 0.35,
+  loaded: false,
+  saveTimer: null,
+  saveVersion: 0
 };
 
 const els = {
@@ -116,6 +119,105 @@ function setStatus(message) {
   els.status.textContent = message;
 }
 
+function serializeGraph() {
+  return {
+    nodes: [...state.nodes.values()].map(node => ({
+      name: node.name,
+      x: node.x,
+      y: node.y
+    })),
+    observations: state.observations.map(observation => ({ ...observation })),
+    expanded: [...state.expanded],
+    pan: { ...state.pan },
+    minConfidence: state.minConfidence
+  };
+}
+
+function hydrateGraph(graph) {
+  const minConfidence = Number(graph && graph.minConfidence);
+  state.nodes.clear();
+  state.observations = [];
+  state.edges.clear();
+  state.expanded.clear();
+  state.selected = null;
+  state.pan = {
+    x: Number(graph && graph.pan && graph.pan.x) || 0,
+    y: Number(graph && graph.pan && graph.pan.y) || 0
+  };
+  state.minConfidence = Number.isFinite(minConfidence) ? Math.max(0, Math.min(1, minConfidence)) : 0.35;
+  els.minConfidence.value = state.minConfidence;
+
+  for (const node of Array.isArray(graph && graph.nodes) ? graph.nodes : []) {
+    const hydrated = ensureNode(node.name);
+    if (!hydrated) continue;
+    const x = Number(node.x);
+    const y = Number(node.y);
+    hydrated.x = Number.isFinite(x) ? x : hydrated.x;
+    hydrated.y = Number.isFinite(y) ? y : hydrated.y;
+    hydrated.vx = 0;
+    hydrated.vy = 0;
+  }
+
+  for (const observation of Array.isArray(graph && graph.observations) ? graph.observations : []) {
+    const from = displayName(observation.from);
+    const to = displayName(observation.to);
+    if (!from || !to || keyFor(from) === keyFor(to)) continue;
+    ensureNode(from);
+    ensureNode(to);
+    state.observations.push({
+      from,
+      to,
+      confidence: Math.max(0, Math.min(1, Number(observation.confidence) || 0.5))
+    });
+  }
+
+  for (const id of Array.isArray(graph && graph.expanded) ? graph.expanded : []) {
+    const key = keyFor(id);
+    if (key) state.expanded.add(key);
+  }
+
+  recomputeEdges();
+}
+
+async function loadGraph() {
+  try {
+    const response = await fetch("/api/graph");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Load failed");
+    hydrateGraph(payload.data);
+    state.loaded = true;
+    const count = state.observations.length;
+    setStatus(count ? `Loaded saved graph with ${count} observations.` : "Ready.");
+  } catch (error) {
+    state.loaded = true;
+    setStatus(`Could not load saved graph: ${error.message}`);
+  }
+  updateUi();
+}
+
+async function saveGraph() {
+  if (!state.loaded) return;
+  const version = ++state.saveVersion;
+  const response = await fetch("/api/graph", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(serializeGraph())
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Save failed");
+  if (version === state.saveVersion) {
+    setStatus(`Saved graph at ${new Date(payload.data.savedAt).toLocaleTimeString()}.`);
+  }
+}
+
+function scheduleSave() {
+  if (!state.loaded) return;
+  window.clearTimeout(state.saveTimer);
+  state.saveTimer = window.setTimeout(() => {
+    saveGraph().catch(error => setStatus(`Could not save graph: ${error.message}`));
+  }, 350);
+}
+
 async function fetchInfluences(entity) {
   const provider = els.provider.value === "mock" ? "mock" : "deepseek";
   const response = await fetch("/api/influences", {
@@ -144,6 +246,7 @@ async function expandEntity(entity) {
 
   state.expanded.add(keyFor(data.entity));
   setStatus(`Expanded ${data.entity} using ${payload.provider}/${payload.model}.`);
+  scheduleSave();
   updateUi();
 }
 
@@ -400,6 +503,7 @@ canvas.addEventListener("pointermove", event => {
 });
 
 canvas.addEventListener("pointerup", () => {
+  if (state.dragging || state.lastPointer) scheduleSave();
   state.dragging = null;
   state.lastPointer = null;
 });
@@ -426,11 +530,13 @@ els.reset.addEventListener("click", () => {
   state.selected = null;
   state.pan = { x: 0, y: 0 };
   setStatus("Reset.");
+  scheduleSave();
   updateUi();
 });
 
 els.minConfidence.addEventListener("input", () => {
   state.minConfidence = Number(els.minConfidence.value);
+  scheduleSave();
   updateUi();
 });
 
@@ -440,5 +546,5 @@ els.autoBudget.addEventListener("input", updateCost);
 window.addEventListener("resize", resizeCanvas);
 
 resizeCanvas();
-updateUi();
+loadGraph();
 draw();

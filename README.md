@@ -12,6 +12,7 @@ Influence Map is a tiny prototype for exploring cultural influence as a generate
 - Observation averaging for repeated entity-to-entity relationships
 - Frontier auto-expansion with a call budget
 - Simple LLM cost estimator
+- Server-side graph persistence to a local JSON file
 
 ## Requirements
 
@@ -41,6 +42,17 @@ npm start
 ```
 
 The browser never receives the API key. It calls the local server at `/api/influences`, and the server calls DeepSeek.
+
+## Persistence
+
+The graph is saved automatically by the local server and restored when the app starts. By default, data is written to `./data/graph.json`, which is ignored by git.
+
+To store it somewhere else:
+
+```powershell
+$env:INFLUENCE_MAP_DATA_FILE="C:\tmp\influence-map.json"
+npm start
+```
 
 ## Data Shape
 
