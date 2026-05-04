@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Influence Map</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="toolbar" aria-label="Graph controls">
+        <div class="brand">
+          <h1>Influence Map</h1>
+          <p>Generate a living graph of what influenced what.</p>
+        </div>
+        <form id="expand-form" class="search">
+          <input id="entity-input" autocomplete="off" placeholder="Start with DayZ, Joy Division, Dune..." value="DayZ">
+          <button type="submit">Expand</button>
+        </form>
+        <div class="controls">
+          <label>
+            <span>Provider</span>
+            <select id="provider-select">
+              <option value="auto">DeepSeek if configured</option>
+              <option value="mock">Mock demo</option>
+            </select>
+          </label>
+          <label>
+            <span>Min confidence</span>
+            <input id="min-confidence" type="range" min="0" max="1" step="0.01" value="0.35">
+            <strong id="min-confidence-value">0.35</strong>
+          </label>
+          <label>
+            <span>Auto budget</span>
+            <input id="auto-budget" type="number" min="1" max="500" value="25">
+          </label>
+          <button id="auto-expand" type="button">Auto expand frontier</button>
+          <button id="reset-graph" type="button">Reset</button>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <canvas id="graph-canvas" width="1200" height="800" aria-label="Influence graph"></canvas>
+        <aside class="panel">
+          <div class="status" id="status">Ready.</div>
+          <div class="metrics">
+            <div><span>Entities</span><strong id="node-count">0</strong></div>
+            <div><span>Edges</span><strong id="edge-count">0</strong></div>
+            <div><span>Observations</span><strong id="observation-count">0</strong></div>
+            <div><span>Expanded</span><strong id="expanded-count">0</strong></div>
+          </div>
+          <section>
+            <h2>Selected</h2>
+            <div id="selected-details" class="details">Click a node or edge.</div>
+          </section>
+          <section>
+            <h2>Cost Sketch</h2>
+            <div class="cost-grid">
+              <label>
+                <span>Tokens per call</span>
+                <input id="tokens-per-call" type="number" min="100" value="1500">
+              </label>
+              <label>
+                <span>Blended $ / 1M</span>
+                <input id="price-per-million" type="number" min="0" step="0.001" value="0.25">
+              </label>
+            </div>
+            <div id="cost-output" class="details"></div>
+          </section>
+          <section>
+            <h2>Frontier</h2>
+            <div id="frontier-list" class="list"></div>
+          </section>
+        </aside>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
