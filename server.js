@@ -1566,11 +1566,13 @@ function identityKind(name) {
   const kinds = new Set();
   if (/\bfilm\b|\bmovie\b/.test(key)) kinds.add("film");
   if (/\bvideo game\b|\bgame\b/.test(key)) kinds.add("game");
-  if (/\bseries\b|\bfranchise\b/.test(key)) kinds.add("series");
+  if (/\bfranchise\b/.test(key)) kinds.add("franchise");
+  if (/\btv series\b|\btelevision series\b/.test(key)) kinds.add("tv-series");
+  else if (/\bseries\b/.test(key)) kinds.add("series");
   if (/\balbum\b/.test(key)) kinds.add("album");
   if (/\bnovel\b|\bbook\b/.test(key)) kinds.add("book");
   if (/\bband\b/.test(key)) kinds.add("band");
-  if (/\btv\b|\btelevision\b/.test(key)) kinds.add("television");
+  if (!kinds.has("tv-series") && /\btv\b|\btelevision\b/.test(key)) kinds.add("television");
   return kinds;
 }
 
@@ -1592,7 +1594,7 @@ function compatibleTitleVariants(names) {
   const explicitKinds = kindSets.filter(set => set.size);
   if (!explicitKinds.length) return false;
   const allKinds = new Set(explicitKinds.flatMap(set => [...set]));
-  if (allKinds.has("series") && allKinds.size > 1) return false;
+  if ((allKinds.has("series") || allKinds.has("franchise")) && allKinds.size > 1) return false;
 
   const compatiblePairs = [
     ["film"],
@@ -1600,6 +1602,7 @@ function compatibleTitleVariants(names) {
     ["album"],
     ["book"],
     ["band"],
+    ["tv-series"],
     ["television"]
   ];
   return compatiblePairs.some(group => {
@@ -1613,7 +1616,7 @@ function identityConflictReason(names = []) {
   const kindSets = clean.map(identityKind);
   const explicitKinds = kindSets.filter(set => set.size);
   const allKinds = new Set(explicitKinds.flatMap(set => [...set]));
-  if (allKinds.has("series") && allKinds.size > 1) {
+  if ((allKinds.has("series") || allKinds.has("franchise")) && allKinds.size > 1) {
     return "series/franchise mixed with a specific work";
   }
 
@@ -1630,6 +1633,37 @@ function identityConflictReason(names = []) {
   return "";
 }
 
+function editDistance(a, b) {
+  const left = String(a || "");
+  const right = String(b || "");
+  if (left === right) return 0;
+  if (!left) return right.length;
+  if (!right) return left.length;
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  const current = Array(right.length + 1).fill(0);
+  for (let i = 1; i <= left.length; i += 1) {
+    current[0] = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + cost
+      );
+    }
+    for (let j = 0; j <= right.length; j += 1) previous[j] = current[j];
+  }
+  return previous[right.length];
+}
+
+function looksLikeSpellingVariant(a, b) {
+  const left = compactKey(baseTitleKey(a) || a);
+  const right = compactKey(baseTitleKey(b) || b);
+  if (left.length < 6 || right.length < 6) return false;
+  const distance = editDistance(left, right);
+  return distance <= 2 || distance / Math.max(left.length, right.length) <= 0.18;
+}
+
 function canAutoApplyIdentity(group) {
   if (!IDENTITY_AUTO_APPROVE || !group) return { ok: false, reason: "automatic identity approval disabled" };
   const action = group.action === "split" ? "split" : group.action === "merge" || group.action === "rename" ? "merge" : "";
@@ -1639,9 +1673,12 @@ function canAutoApplyIdentity(group) {
   if (entities.length > 4) return { ok: false, reason: "too many entities for automatic edit" };
   const confidence = clampConfidence(group.confidence);
   const threshold = action === "split" ? IDENTITY_AUTO_SPLIT_CONFIDENCE : IDENTITY_AUTO_MERGE_CONFIDENCE;
-  if (confidence < threshold) return { ok: false, reason: `confidence below ${Math.round(threshold * 100)}%` };
   const conflict = identityConflictReason([group.canonical, ...entities]);
   if (conflict) return { ok: false, reason: conflict };
+  const spellingVariant = entities.some(entity => looksLikeSpellingVariant(entity, group.canonical));
+  if (confidence < threshold && !(action === "split" && spellingVariant && confidence >= 0.7)) {
+    return { ok: false, reason: `confidence below ${Math.round(threshold * 100)}%` };
+  }
   if (action === "split") {
     const ids = group.metadata && Array.isArray(group.metadata.moveObservationIds) ? group.metadata.moveObservationIds : [];
     if (!ids.length) return { ok: false, reason: "split has no exact movable observation ids" };
@@ -2347,13 +2384,71 @@ async function handleApiDedupeReview(req, res, url) {
 async function handleApiDedupeSuggestions(req, res, url) {
   if (!requireAdmin(req, res, url)) return;
   try {
+    sendJson(res, 200, { suggestions: pendingDedupeSuggestions() });
+  } catch (error) {
+    sendJson(res, 500, { error: error.message || "Could not load dedupe suggestions" });
+  }
+}
+
+async function handleApiDedupeAutoResolve(req, res, url) {
+  if (!requireAdmin(req, res, url)) return;
+  try {
     const autoIdentity = autoResolvePendingIdentity();
     sendJson(res, 200, {
       suggestions: pendingDedupeSuggestions(),
-      autoIdentity
+      autoIdentity,
+      data: autoIdentity.applied ? graphFromDb() : null
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Could not load dedupe suggestions" });
+    sendJson(res, 500, { error: error.message || "Could not auto-resolve dedupe suggestions" });
+  }
+}
+
+function orphanNodes() {
+  return db.prepare(`
+    SELECT n.id, n.name, n.expanded, n.aliases, n.created_at, n.updated_at
+    FROM nodes n
+    LEFT JOIN observations o1 ON o1.from_id = n.id
+    LEFT JOIN observations o2 ON o2.to_id = n.id
+    WHERE o1.id IS NULL AND o2.id IS NULL
+    ORDER BY n.updated_at DESC, n.name COLLATE NOCASE
+  `).all().map(row => ({
+    id: row.id,
+    name: row.name,
+    expanded: Boolean(row.expanded),
+    aliases: parseJson(row.aliases, []),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  }));
+}
+
+async function handleApiOrphans(req, res, url) {
+  if (!requireAdmin(req, res, url)) return;
+  try {
+    if (req.method === "GET") {
+      return sendJson(res, 200, { orphans: orphanNodes() });
+    }
+    if (req.method === "DELETE") {
+      const orphans = orphanNodes();
+      const remove = db.prepare("DELETE FROM nodes WHERE id = ?");
+      db.exec("BEGIN");
+      try {
+        for (const orphan of orphans) remove.run(orphan.id);
+        setSetting("savedAt", nowIso());
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      return sendJson(res, 200, {
+        removed: orphans.length,
+        orphans,
+        data: graphFromDb()
+      });
+    }
+    return sendJson(res, 405, { error: "Method not allowed" });
+  } catch (error) {
+    return sendJson(res, 500, { error: error.message || "Orphan cleanup failed" });
   }
 }
 
@@ -2563,6 +2658,14 @@ const server = http.createServer((req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/dedupe-suggestions") {
     handleApiDedupeSuggestions(req, res, url);
+    return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/dedupe-auto-resolve") {
+    handleApiDedupeAutoResolve(req, res, url);
+    return;
+  }
+  if ((req.method === "GET" || req.method === "DELETE") && url.pathname === "/api/orphans") {
+    handleApiOrphans(req, res, url);
     return;
   }
   if (req.method === "GET" && url.pathname === "/api/profiles") {

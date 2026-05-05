@@ -31,9 +31,15 @@ const state = {
   identityFilter: "all",
   identitySuggestions: [],
   diagnostics: null,
+  rootTrace: null,
+  rootTraceCache: new Map(),
+  rootMetricsCache: null,
+  expansionRecommendationsCache: null,
+  graphAnalysisVersion: 0,
   panelTab: "selected",
   activities: [],
-  activityCounter: 0
+  activityCounter: 0,
+  physicsFrame: 0
 };
 
 const els = {
@@ -61,8 +67,12 @@ const els = {
   activitySummary: document.querySelector("#activity-summary"),
   identitySummary: document.querySelector("#identity-summary"),
   activityList: document.querySelector("#activity-list"),
+  rootsOutput: document.querySelector("#roots-output"),
+  nextOutput: document.querySelector("#next-output"),
   selectedDetails: document.querySelector("#selected-details"),
   dedupeReview: document.querySelector("#dedupe-review"),
+  previewOrphans: document.querySelector("#preview-orphans"),
+  cleanOrphans: document.querySelector("#clean-orphans"),
   dedupeOutput: document.querySelector("#dedupe-output"),
   refreshDiagnostics: document.querySelector("#refresh-diagnostics"),
   runBenchmark: document.querySelector("#run-benchmark"),
@@ -122,6 +132,14 @@ function edgeKey(from, to) {
   return `${keyFor(from)}=>${keyFor(to)}`;
 }
 
+function invalidateGraphAnalysis() {
+  state.graphAnalysisVersion += 1;
+  state.rootTrace = null;
+  state.rootTraceCache.clear();
+  state.rootMetricsCache = null;
+  state.expansionRecommendationsCache = null;
+}
+
 function ensureNode(name) {
   const id = keyFor(name);
   const label = displayName(name);
@@ -155,6 +173,7 @@ function renameNode(nodeOrName, nextName) {
     return state.nodes.get(previousId) || ensureNode(canonical);
   }
 
+  invalidateGraphAnalysis();
   const previous = state.nodes.get(previousId);
   if (previousId !== nextId && state.expanded.has(previousId)) {
     const canonicalNode = ensureNode(canonical);
@@ -217,6 +236,7 @@ function addObservation(from, to, confidence, meta = {}) {
     model: displayName(meta.model || ""),
     createdAt: meta.createdAt || new Date().toISOString()
   });
+  invalidateGraphAnalysis();
   recomputeEdges();
 }
 
@@ -326,6 +346,9 @@ function selectedNodeId() {
 }
 
 function highlightedNodeIds() {
+  if (state.rootTrace && state.rootTrace.nodeIds && state.rootTrace.nodeIds.size) {
+    return new Set(state.rootTrace.nodeIds);
+  }
   const rootId = selectedNodeId() || state.hovered || "";
   const ids = new Set();
   if (!rootId) return ids;
@@ -342,6 +365,9 @@ function focusNodeId() {
 }
 
 function edgeDirectionFor(edge, rootId) {
+  if (state.rootTrace && state.rootTrace.edgeKeys && state.rootTrace.edgeKeys.has(edgeKey(edge.from.name, edge.to.name))) {
+    return "root";
+  }
   if (!rootId) return "";
   if (edge.to.id === rootId) return "incoming";
   if (edge.from.id === rootId) return "outgoing";
@@ -447,6 +473,440 @@ function entityStats() {
     ...item,
     connectionCount: item.connections.size
   }));
+}
+
+function allGraphEdges() {
+  const merged = new Map(state.hiddenEdges);
+  for (const [key, edge] of state.edges) merged.set(key, edge);
+  return [...merged].map(([key, edge]) => ({ key, ...edge }));
+}
+
+function buildIncomingIndex() {
+  const incoming = new Map();
+  for (const edge of allGraphEdges()) {
+    const bucket = incoming.get(edge.to.id) || [];
+    bucket.push(edge);
+    incoming.set(edge.to.id, bucket);
+  }
+  for (const bucket of incoming.values()) {
+    bucket.sort((a, b) => (b.confidence * Math.log2(b.count + 1)) - (a.confidence * Math.log2(a.count + 1)));
+  }
+  return incoming;
+}
+
+function buildOutgoingIndex() {
+  const outgoing = new Map();
+  for (const edge of allGraphEdges()) {
+    const bucket = outgoing.get(edge.from.id) || [];
+    bucket.push(edge);
+    outgoing.set(edge.from.id, bucket);
+  }
+  return outgoing;
+}
+
+function traceRoots(targetId, options = {}, indexes = {}) {
+  const target = state.nodes.get(targetId);
+  if (!target) return null;
+  const maxDepth = Math.max(2, Math.min(10, Number(options.depth || 7)));
+  const branchLimit = Math.max(2, Math.min(8, Number(options.branchLimit || 5)));
+  const incoming = indexes.incoming || buildIncomingIndex();
+  const roots = new Map();
+  const paths = [];
+  const traceNodeIds = new Set([target.id]);
+  const traceEdgeKeys = new Set();
+
+  function addRoot(node, path, score, depth, terminalReason) {
+    const existing = roots.get(node.id) || {
+      node,
+      score: 0,
+      paths: 0,
+      bestScore: 0,
+      maxDepth: 0,
+      terminalReason
+    };
+    existing.score += score;
+    existing.paths += 1;
+    existing.bestScore = Math.max(existing.bestScore, score);
+    existing.maxDepth = Math.max(existing.maxDepth, depth);
+    roots.set(node.id, existing);
+    paths.push({ root: node, path: [...path], score, depth, terminalReason });
+    for (const step of path) {
+      traceNodeIds.add(step.from.id);
+      traceNodeIds.add(step.to.id);
+      traceEdgeKeys.add(step.key);
+    }
+  }
+
+  function walk(node, path, score, visited) {
+    const depth = path.length;
+    const incomingEdges = (incoming.get(node.id) || [])
+      .filter(edge => !visited.has(edge.from.id))
+      .slice(0, branchLimit);
+    if (!incomingEdges.length || depth >= maxDepth) {
+      addRoot(node, path, score * (1 + depth * 0.12), depth, incomingEdges.length ? "depth limit" : "no known upstream influences");
+      return;
+    }
+    for (const edge of incomingEdges) {
+      const nextScore = score * Math.max(0.08, edge.confidence) * (1 + Math.log2(edge.count + 1) * 0.08);
+      walk(edge.from, [edge, ...path], nextScore, new Set([...visited, edge.from.id]));
+    }
+  }
+
+  walk(target, [], 1, new Set([target.id]));
+  return {
+    target,
+    nodeIds: traceNodeIds,
+    edgeKeys: traceEdgeKeys,
+    roots: [...roots.values()]
+      .filter(item => item.node.id !== target.id)
+      .sort((a, b) => b.score - a.score || b.maxDepth - a.maxDepth)
+      .slice(0, 12),
+    paths: paths
+      .filter(item => item.root.id !== target.id && item.path.length)
+      .sort((a, b) => b.score - a.score || b.depth - a.depth)
+      .slice(0, 8)
+  };
+}
+
+function cachedTraceRoots(targetId, options = {}, indexes = {}) {
+  const depth = Math.max(2, Math.min(10, Number(options.depth || 7)));
+  const branchLimit = Math.max(2, Math.min(8, Number(options.branchLimit || 5)));
+  const key = `${state.graphAnalysisVersion}:${targetId}:${depth}:${branchLimit}`;
+  if (state.rootTraceCache.has(key)) return state.rootTraceCache.get(key);
+  const trace = traceRoots(targetId, { depth, branchLimit }, indexes);
+  state.rootTraceCache.set(key, trace);
+  if (state.rootTraceCache.size > 400) {
+    const first = state.rootTraceCache.keys().next().value;
+    state.rootTraceCache.delete(first);
+  }
+  return trace;
+}
+
+function globalInfluenceMetrics(limit = 12) {
+  const requestedLimit = Math.max(1, Number(limit) || 12);
+  if (
+    state.rootMetricsCache
+    && state.rootMetricsCache.version === state.graphAnalysisVersion
+    && state.rootMetricsCache.limit >= requestedLimit
+  ) {
+    return state.rootMetricsCache.scores.slice(0, requestedLimit);
+  }
+
+  const edges = allGraphEdges();
+  const outgoing = new Map();
+  const incoming = new Map();
+  for (const edge of edges) {
+    const outBucket = outgoing.get(edge.from.id) || [];
+    outBucket.push(edge);
+    outgoing.set(edge.from.id, outBucket);
+    const inBucket = incoming.get(edge.to.id) || [];
+    inBucket.push(edge);
+    incoming.set(edge.to.id, inBucket);
+  }
+  for (const bucket of incoming.values()) {
+    bucket.sort((a, b) => (b.confidence * Math.log2(b.count + 1)) - (a.confidence * Math.log2(a.count + 1)));
+  }
+  const bridgeCounts = new Map();
+  const rootCounts = new Map();
+
+  for (const node of state.nodes.values()) {
+    const trace = cachedTraceRoots(node.id, { depth: 5, branchLimit: 3 }, { incoming });
+    if (!trace) continue;
+    for (const root of trace.roots.slice(0, 8)) {
+      rootCounts.set(root.node.id, (rootCounts.get(root.node.id) || 0) + root.score);
+    }
+    for (const path of trace.paths.slice(0, 6)) {
+      const inner = path.path.slice(1, -1);
+      for (const edge of inner) {
+        bridgeCounts.set(edge.to.id, (bridgeCounts.get(edge.to.id) || 0) + path.score);
+      }
+    }
+  }
+
+  const scores = [];
+  for (const node of state.nodes.values()) {
+    const seen = new Set([node.id]);
+    let frontier = [{ node, depth: 0, score: 1 }];
+    let downstream = 0;
+    let confidenceFlow = 0;
+    const firstBranches = new Set();
+    for (let depth = 0; depth < 6; depth += 1) {
+      const next = [];
+      for (const item of frontier) {
+        for (const edge of outgoing.get(item.node.id) || []) {
+          if (seen.has(edge.to.id)) continue;
+          seen.add(edge.to.id);
+          if (depth === 0) firstBranches.add(edge.to.id);
+          const edgeScore = item.score * Math.max(0.1, edge.confidence) * (1 + Math.log2(edge.count + 1) * 0.08);
+          downstream += 1 / (depth + 1);
+          confidenceFlow += edgeScore;
+          next.push({ node: edge.to, depth: depth + 1, score: edgeScore });
+        }
+      }
+      frontier = next
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 90);
+      if (!frontier.length) break;
+    }
+    const upstreamCount = (incoming.get(node.id) || []).length;
+    const directOut = (outgoing.get(node.id) || []).length;
+    const reachScore = downstream + confidenceFlow;
+    const rootScore = (rootCounts.get(node.id) || 0) * (1 / Math.sqrt(1 + upstreamCount));
+    const bridgeScore = bridgeCounts.get(node.id) || 0;
+    const diversityScore = Math.sqrt(firstBranches.size) * Math.log2(2 + directOut);
+    const sourceBias = 1 / Math.sqrt(1 + upstreamCount * 0.65);
+    const trailblazerScore = (reachScore * 0.42 + rootScore * 0.34 + bridgeScore * 0.16 + diversityScore * 0.08) * sourceBias;
+    if (trailblazerScore > 0) {
+      scores.push({
+        node,
+        score: trailblazerScore,
+        reachScore,
+        rootScore,
+        bridgeScore,
+        diversityScore,
+        downstream: seen.size - 1,
+        directOut,
+        upstreamCount
+      });
+    }
+  }
+  const sorted = scores.sort((a, b) => b.score - a.score);
+  state.rootMetricsCache = {
+    version: state.graphAnalysisVersion,
+    limit: Math.max(requestedLimit, 20),
+    scores: sorted.slice(0, Math.max(requestedLimit, 20))
+  };
+  return state.rootMetricsCache.scores.slice(0, requestedLimit);
+}
+
+function componentMapExcluding(excludedId) {
+  const adjacency = new Map([...state.nodes.keys()].map(id => [id, []]));
+  for (const edge of allGraphEdges()) {
+    if (edge.from.id === excludedId || edge.to.id === excludedId) continue;
+    if (adjacency.has(edge.from.id)) adjacency.get(edge.from.id).push(edge.to.id);
+    if (adjacency.has(edge.to.id)) adjacency.get(edge.to.id).push(edge.from.id);
+  }
+  const components = new Map();
+  let component = 0;
+  for (const id of adjacency.keys()) {
+    if (id === excludedId || components.has(id)) continue;
+    component += 1;
+    const stack = [id];
+    components.set(id, component);
+    while (stack.length) {
+      const current = stack.pop();
+      for (const next of adjacency.get(current) || []) {
+        if (next === excludedId || components.has(next)) continue;
+        components.set(next, component);
+        stack.push(next);
+      }
+    }
+  }
+  return components;
+}
+
+function expansionRecommendations(limit = 12) {
+  const requestedLimit = Math.max(1, Number(limit) || 12);
+  if (
+    state.expansionRecommendationsCache
+    && state.expansionRecommendationsCache.version === state.graphAnalysisVersion
+    && state.expansionRecommendationsCache.limit >= requestedLimit
+  ) {
+    return state.expansionRecommendationsCache.items.slice(0, requestedLimit);
+  }
+
+  const edges = allGraphEdges();
+  const stats = new Map([...state.nodes.values()].map(node => [node.id, {
+    node,
+    observations: 0,
+    confidenceSum: 0,
+    neighbors: new Set(),
+    sourceEntities: new Set(),
+    incoming: 0,
+    outgoing: 0
+  }]));
+  for (const obs of state.observations) {
+    const from = keyFor(obs.from);
+    const to = keyFor(obs.to);
+    const confidence = Math.max(0, Math.min(1, Number(obs.confidence) || 0));
+    if (stats.has(from)) {
+      const item = stats.get(from);
+      item.observations += 1;
+      item.confidenceSum += confidence;
+      item.neighbors.add(to);
+      item.outgoing += 1;
+      if (obs.sourceEntity) item.sourceEntities.add(keyFor(obs.sourceEntity));
+    }
+    if (stats.has(to)) {
+      const item = stats.get(to);
+      item.observations += 1;
+      item.confidenceSum += confidence;
+      item.neighbors.add(from);
+      item.incoming += 1;
+      if (obs.sourceEntity) item.sourceEntities.add(keyFor(obs.sourceEntity));
+    }
+  }
+
+  const items = [];
+  for (const stat of stats.values()) {
+    const node = stat.node;
+    if (state.expanded.has(node.id) || state.expanding.has(node.id) || !stat.observations) continue;
+    const components = componentMapExcluding(node.id);
+    const neighborComponents = new Set();
+    const spatialSectors = new Set();
+    for (const neighborId of stat.neighbors) {
+      const component = components.get(neighborId);
+      if (component) neighborComponents.add(component);
+      const neighbor = state.nodes.get(neighborId);
+      if (neighbor) {
+        const angle = Math.atan2(neighbor.y - node.y, neighbor.x - node.x);
+        spatialSectors.add(Math.floor(((angle + Math.PI) / (Math.PI * 2)) * 8));
+      }
+    }
+    const regionCount = Math.max(1, neighborComponents.size, spatialSectors.size);
+    const avgConfidence = stat.confidenceSum / Math.max(1, stat.observations);
+    const connectedEdges = edges.filter(edge => edge.from.id === node.id || edge.to.id === node.id);
+    const strongLinks = connectedEdges.filter(edge => edge.confidence >= 0.55).length;
+    const name = canonicalName(node.name);
+    const hasQualifier = /\(|\[|\b(1[0-9]{3}|20[0-9]{2})\b/.test(node.name);
+    const shortName = name.split(" ").filter(Boolean).length <= 2;
+    const ambiguityScore = shortName && !hasQualifier && stat.observations >= 2 ? 1 : 0;
+    const recurrenceScore = Math.log2(1 + stat.observations) * 1.25;
+    const bridgeScore = Math.log2(1 + regionCount) * Math.sqrt(1 + stat.neighbors.size);
+    const sourceScore = Math.log2(1 + stat.sourceEntities.size);
+    const confidenceScore = avgConfidence * 1.4;
+    const directionScore = stat.incoming && stat.outgoing ? 0.75 : 0.25;
+    const strongLinkScore = Math.log2(1 + strongLinks) * 0.5;
+    const value = recurrenceScore + bridgeScore + sourceScore + confidenceScore + directionScore + strongLinkScore + ambiguityScore;
+    const reasons = [];
+    if (regionCount > 1) reasons.push(`touches ${regionCount} map neighborhoods`);
+    if (stat.sourceEntities.size > 1) reasons.push(`seen from ${stat.sourceEntities.size} sampled entities`);
+    if (stat.incoming && stat.outgoing) reasons.push("has both incoming and outgoing hints");
+    if (ambiguityScore) reasons.push("short or ambiguous name may clarify identity");
+    if (!reasons.length) reasons.push("unexpanded frontier node with existing evidence");
+    items.push({
+      node,
+      value,
+      observations: stat.observations,
+      connections: stat.neighbors.size,
+      avgConfidence,
+      regions: regionCount,
+      reasons
+    });
+  }
+
+  const sorted = items.sort((a, b) => b.value - a.value || b.observations - a.observations || a.node.name.localeCompare(b.node.name));
+  state.expansionRecommendationsCache = {
+    version: state.graphAnalysisVersion,
+    limit: Math.max(requestedLimit, 30),
+    items: sorted.slice(0, Math.max(requestedLimit, 30))
+  };
+  return state.expansionRecommendationsCache.items.slice(0, requestedLimit);
+}
+
+function metricBars(item) {
+  const values = [
+    ["Reach", item.reachScore],
+    ["Root", item.rootScore],
+    ["Bridge", item.bridgeScore],
+    ["Diversity", item.diversityScore]
+  ];
+  const max = Math.max(1, ...values.map(([, value]) => Number(value) || 0));
+  return `<div class="metric-bars">${values.map(([label, value]) => `
+    <span><b style="width:${Math.max(4, Math.min(100, (Number(value || 0) / max) * 100)).toFixed(0)}%"></b>${label} ${Number(value || 0).toFixed(1)}</span>
+  `).join("")}</div>`;
+}
+
+function expansionValueBars(item) {
+  const values = [
+    ["Regions", item.regions],
+    ["Evidence", item.observations],
+    ["Confidence", item.avgConfidence * 10],
+    ["Links", item.connections]
+  ];
+  const max = Math.max(1, ...values.map(([, value]) => Number(value) || 0));
+  return `<div class="metric-bars next-bars">${values.map(([label, value]) => `
+    <span><b style="width:${Math.max(4, Math.min(100, (Number(value || 0) / max) * 100)).toFixed(0)}%"></b>${label} ${label === "Confidence" ? `${Math.round(item.avgConfidence * 100)}%` : Number(value || 0).toFixed(0)}</span>
+  `).join("")}</div>`;
+}
+
+function renderNextPanel() {
+  if (!els.nextOutput) return;
+  if (state.panelTab !== "next") return;
+  const items = expansionRecommendations(12);
+  if (!items.length) {
+    els.nextOutput.innerHTML = `
+      <div class="roots-empty">No high-value unexpanded frontier nodes yet. Search or expand an entity to create more candidates.</div>
+    `;
+    return;
+  }
+  els.nextOutput.innerHTML = `
+    <div class="roots-summary">
+      <strong>Highest expected expansion value</strong>
+      <span>Local math only: no model call is used to rank these. It favors nodes that may connect regions, repeat across observations, or clarify ambiguous names.</span>
+    </div>
+    <ol class="next-list">${items.map(item => `
+      <li>
+        <button type="button" data-next-node="${escapeHtml(item.node.id)}">${escapeHtml(item.node.name)}</button>
+        <span>value ${item.value.toFixed(2)} - ${item.observations} observation${item.observations === 1 ? "" : "s"} - ${item.connections} connection${item.connections === 1 ? "" : "s"}</span>
+        <p>${escapeHtml(item.reasons.join("; "))}</p>
+        ${expansionValueBars(item)}
+        <button type="button" data-next-expand="${escapeHtml(item.node.id)}">Expand this next</button>
+      </li>
+    `).join("")}</ol>
+  `;
+}
+
+function renderRootsPanel() {
+  if (!els.rootsOutput) return;
+  if (state.panelTab !== "roots") {
+    state.rootTrace = null;
+    return;
+  }
+  const selectedId = selectedNodeId();
+  const trailblazers = globalInfluenceMetrics(10);
+  if (!selectedId) {
+    state.rootTrace = null;
+    els.rootsOutput.innerHTML = `
+      <div class="roots-empty">Select a node to trace its upstream lineage. Global trailblazers blend downstream reach, root-likeness, bridge influence, and branch diversity.</div>
+      <h3>Global Trailblazers</h3>
+      <ol class="roots-list">${trailblazers.map(item => `
+        <li><button type="button" data-root-node="${escapeHtml(item.node.id)}">${escapeHtml(item.node.name)}</button><span>trailblazer ${item.score.toFixed(2)} - reaches ${item.downstream} - ${item.upstreamCount} upstream</span>${metricBars(item)}</li>
+      `).join("")}</ol>
+    `;
+    return;
+  }
+  const trace = cachedTraceRoots(selectedId);
+  state.rootTrace = trace;
+  if (!trace) {
+    els.rootsOutput.textContent = "No root trace available.";
+    return;
+  }
+  const rootRows = trace.roots.length ? trace.roots.map(root => `
+    <li>
+      <button type="button" data-root-node="${escapeHtml(root.node.id)}">${escapeHtml(root.node.name)}</button>
+      <span>root score ${root.score.toFixed(2)} - ${root.paths} path${root.paths === 1 ? "" : "s"} - depth ${root.maxDepth}</span>
+    </li>
+  `).join("") : `<li><span>No upstream roots found yet. Expand influences around ${escapeHtml(trace.target.name)} to grow the lineage.</span></li>`;
+  const pathRows = trace.paths.length ? trace.paths.map(path => `
+    <li>
+      <strong>${escapeHtml(path.root.name)}</strong>
+      <span>${escapeHtml(path.path.map(edge => edge.from.name).concat(trace.target.name).join(" -> "))}</span>
+    </li>
+  `).join("") : "";
+  els.rootsOutput.innerHTML = `
+    <div class="roots-summary">
+      <strong>${escapeHtml(trace.target.name)}</strong>
+      <span>${trace.roots.length} candidate root${trace.roots.length === 1 ? "" : "s"} from ${trace.paths.length} strongest lineage path${trace.paths.length === 1 ? "" : "s"}.</span>
+    </div>
+    <h3>Likely Roots</h3>
+    <ol class="roots-list">${rootRows}</ol>
+    ${pathRows ? `<h3>Strongest Paths</h3><ol class="roots-paths">${pathRows}</ol>` : ""}
+    <h3>Global Trailblazers</h3>
+    <ol class="roots-list compact">${trailblazers.map(item => `
+      <li><button type="button" data-root-node="${escapeHtml(item.node.id)}">${escapeHtml(item.node.name)}</button><span>${item.score.toFixed(2)} trailblazer - ${item.downstream} downstream - ${item.upstreamCount} upstream</span>${metricBars(item)}</li>
+    `).join("")}</ol>
+  `;
 }
 
 function renderEntityTable() {
@@ -686,6 +1146,11 @@ async function loadDiagnostics() {
 
 async function runBenchmark() {
   if (!state.devTools || !els.diagnosticsOutput) return;
+  const confirmed = window.confirm("Run benchmark will make two small model requests. Continue?");
+  if (!confirmed) {
+    setStatus("Benchmark cancelled.");
+    return;
+  }
   els.diagnosticsOutput.textContent = "Running model benchmark...";
   const response = await fetch("/api/llm-benchmark", {
     method: "POST",
@@ -941,6 +1406,7 @@ function hydrateGraph(graph) {
     if (key) state.expanded.add(key);
   }
 
+  invalidateGraphAnalysis();
   recomputeEdges();
 }
 
@@ -1162,12 +1628,24 @@ function renderDedupeSuggestions(suggestions) {
 }
 
 async function loadDedupeSuggestions() {
+  let autoIdentity = null;
+  if (state.devTools) {
+    const autoResponse = await fetch("/api/dedupe-auto-resolve", {
+      method: "POST",
+      headers: adminHeaders()
+    });
+    const autoPayload = await autoResponse.json();
+    if (autoResponse.ok) {
+      autoIdentity = autoPayload.autoIdentity || null;
+      if (autoPayload.data) hydrateGraph(autoPayload.data);
+    }
+  }
   const response = await fetch("/api/dedupe-suggestions", { headers: adminHeaders() });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Could not load identity decisions");
   state.identitySuggestions = payload.suggestions || [];
   renderDedupeSuggestions(payload.suggestions || []);
-  const autoIdentity = payload.autoIdentity || {};
+  autoIdentity = autoIdentity || payload.autoIdentity || {};
   const applied = Number(autoIdentity.applied || 0);
   const cleared = Number(autoIdentity.clearedChecks || 0);
   if (applied || cleared) {
@@ -1196,6 +1674,57 @@ async function decideDedupeSuggestion(id, action) {
     : "Marked rejected";
   updateActivity(activityId, { status: "done", detail });
   setStatus(action === "approve" ? detail : "Rejected identity decision.");
+}
+
+async function previewOrphanNodes() {
+  const response = await fetch("/api/orphans", { headers: adminHeaders() });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Could not preview orphan nodes");
+  const orphans = payload.orphans || [];
+  if (els.cleanOrphans) els.cleanOrphans.disabled = !orphans.length;
+  if (!orphans.length) {
+    els.dedupeOutput.textContent = "No orphan nodes found.";
+    setStatus("No orphan nodes found.");
+    return;
+  }
+  els.dedupeOutput.innerHTML = `
+    <div class="identity-empty">
+      Found ${orphans.length} orphan node${orphans.length === 1 ? "" : "s"} with no observations. These do not affect edges, but they can clutter search and table views.
+    </div>
+    <ul class="orphan-list">${orphans.slice(0, 30).map(orphan => `
+      <li>${escapeHtml(orphan.name)}${orphan.expanded ? " <span>expanded</span>" : ""}</li>
+    `).join("")}</ul>
+    ${orphans.length > 30 ? `<div class="identity-empty">Showing 30 of ${orphans.length}.</div>` : ""}
+  `;
+  setStatus(`Found ${orphans.length} orphan node${orphans.length === 1 ? "" : "s"}.`);
+}
+
+async function cleanOrphanNodes() {
+  const preview = await fetch("/api/orphans", { headers: adminHeaders() });
+  const previewPayload = await preview.json();
+  if (!preview.ok) throw new Error(previewPayload.error || "Could not preview orphan nodes");
+  const orphans = previewPayload.orphans || [];
+  if (!orphans.length) {
+    if (els.cleanOrphans) els.cleanOrphans.disabled = true;
+    els.dedupeOutput.textContent = "No orphan nodes found.";
+    return;
+  }
+  const confirmed = window.confirm(`Delete ${orphans.length} orphan node${orphans.length === 1 ? "" : "s"} with no observations? This removes local database rows.`);
+  if (!confirmed) {
+    setStatus("Orphan cleanup cancelled.");
+    return;
+  }
+  const response = await fetch("/api/orphans", {
+    method: "DELETE",
+    headers: adminHeaders()
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Could not clean orphan nodes");
+  if (payload.data) hydrateGraph(payload.data);
+  if (els.cleanOrphans) els.cleanOrphans.disabled = true;
+  els.dedupeOutput.textContent = `Removed ${payload.removed || 0} orphan node${Number(payload.removed || 0) === 1 ? "" : "s"}.`;
+  setStatus(`Removed ${payload.removed || 0} orphan node${Number(payload.removed || 0) === 1 ? "" : "s"}.`);
+  updateUi();
 }
 
 async function expandEntity(entity, options = {}) {
@@ -1383,6 +1912,8 @@ async function searchEntity(entity) {
 }
 
 function getFrontier() {
+  const recommended = expansionRecommendations(40).map(item => item.node);
+  if (recommended.length) return recommended;
   const connected = new Map();
   for (const edge of state.edges.values()) {
     connected.set(edge.from.id, edge.from);
@@ -1436,26 +1967,63 @@ async function autoExpandFrontier() {
 function simulatePhysics() {
   const nodes = [...state.nodes.values()];
   const edges = [...state.edges.values(), ...state.hiddenEdges.values()];
+  state.physicsFrame += 1;
   for (const node of nodes) {
-    node.vx *= 0.86;
-    node.vy *= 0.86;
+    node.vx *= 0.78;
+    node.vy *= 0.78;
   }
 
-  for (let i = 0; i < nodes.length; i += 1) {
-    for (let j = i + 1; j < nodes.length; j += 1) {
-      const a = nodes[i];
-      const b = nodes[j];
-      const dx = a.x - b.x;
-      const dy = a.y - b.y;
-      const distSq = Math.max(80, dx * dx + dy * dy);
-      const force = 1800 / distSq;
-      const dist = Math.sqrt(distSq);
-      const fx = (dx / dist) * force;
-      const fy = (dy / dist) * force;
-      a.vx += fx;
-      a.vy += fy;
-      b.vx -= fx;
-      b.vy -= fy;
+  function repel(a, b, strength = 1600) {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    const distSq = Math.max(80, dx * dx + dy * dy);
+    const force = strength / distSq;
+    const dist = Math.sqrt(distSq);
+    const fx = (dx / dist) * force;
+    const fy = (dy / dist) * force;
+    a.vx += fx;
+    a.vy += fy;
+    b.vx -= fx;
+    b.vy -= fy;
+  }
+
+  if (nodes.length <= 450) {
+    for (let i = 0; i < nodes.length; i += 1) {
+      for (let j = i + 1; j < nodes.length; j += 1) {
+        repel(nodes[i], nodes[j]);
+      }
+    }
+  } else {
+    const cellSize = 260;
+    const grid = new Map();
+    const cellKey = (x, y) => `${x},${y}`;
+    for (const node of nodes) {
+      const cx = Math.floor(node.x / cellSize);
+      const cy = Math.floor(node.y / cellSize);
+      const key = cellKey(cx, cy);
+      const bucket = grid.get(key) || [];
+      bucket.push(node);
+      grid.set(key, bucket);
+    }
+    const neighborOffsets = [
+      [0, 0],
+      [1, 0],
+      [0, 1],
+      [1, 1],
+      [-1, 1]
+    ];
+    for (const [key, bucket] of grid) {
+      const [cx, cy] = key.split(",").map(Number);
+      for (const [dx, dy] of neighborOffsets) {
+        const otherBucket = grid.get(cellKey(cx + dx, cy + dy));
+        if (!otherBucket) continue;
+        for (let i = 0; i < bucket.length; i += 1) {
+          const start = otherBucket === bucket ? i + 1 : 0;
+          for (let j = start; j < otherBucket.length; j += 1) {
+            repel(bucket[i], otherBucket[j], 1300);
+          }
+        }
+      }
     }
   }
 
@@ -1476,6 +2044,15 @@ function simulatePhysics() {
 
   for (const node of nodes) {
     if (state.dragging === node.id) continue;
+    const speed = Math.hypot(node.vx, node.vy);
+    if (speed > 5) {
+      const scale = 5 / speed;
+      node.vx *= scale;
+      node.vy *= scale;
+    } else if (speed < 0.015) {
+      node.vx = 0;
+      node.vy = 0;
+    }
     node.x += node.vx;
     node.y += node.vy;
   }
@@ -1496,8 +2073,11 @@ function drawArrow(from, to, confidence, count, selected, hidden = false, faded 
   const dashed = hidden || (weak && !selected);
 
   const directional = direction === "incoming" || direction === "outgoing";
+  const rootPath = direction === "root";
   const alpha = hidden ? (faded ? 0.06 : 0.2) : faded ? 0.08 : weak ? 0.16 + confidence * 0.34 : 0.2 + confidence * 0.48;
-  ctx.strokeStyle = directional
+  ctx.strokeStyle = rootPath
+    ? `rgba(119, 77, 172, ${hidden ? 0.48 : 0.92})`
+    : directional
     ? direction === "incoming"
       ? `rgba(44, 111, 187, ${hidden ? 0.42 : 0.88})`
       : `rgba(191, 112, 38, ${hidden ? 0.42 : 0.9})`
@@ -1506,7 +2086,7 @@ function drawArrow(from, to, confidence, count, selected, hidden = false, faded 
       : selected
         ? "#b4472f"
         : `rgba(31, 35, 38, ${alpha})`;
-  ctx.lineWidth = directional ? Math.max(2.2, width + 0.8) : hidden ? 1 : weak ? Math.max(1, width * 0.72) : width;
+  ctx.lineWidth = rootPath ? Math.max(2.6, width + 1.2) : directional ? Math.max(2.2, width + 0.8) : hidden ? 1 : weak ? Math.max(1, width * 0.72) : width;
   if (dashed) ctx.setLineDash([5, 7]);
   ctx.beginPath();
   ctx.moveTo(startX, startY);
@@ -1626,6 +2206,11 @@ function updateSelectedDetails() {
   }
   if (state.selected.type === "node") {
     const node = state.nodes.get(state.selected.id);
+    if (!node) {
+      state.selected = null;
+      els.selectedDetails.innerHTML = `Click a node or edge.<br><button id="clear-selection" type="button" disabled>Clear selection</button>`;
+      return;
+    }
     const incoming = [...state.edges.values()].filter(edge => edge.to.id === node.id).length;
     const outgoing = [...state.edges.values()].filter(edge => edge.from.id === node.id).length;
     const hiddenIncoming = [...state.hiddenEdges.values()].filter(edge => edge.to.id === node.id).length;
@@ -1639,17 +2224,27 @@ function updateSelectedDetails() {
     const stateLabel = isExpanding ? "Expanding now..." : isExpanded ? "Expanded" : "Not expanded yet";
     const actionLabel = isExpanding ? "Expanding..." : isExpanded ? "Sample again" : "Expand this entity";
     const actionHint = isExpanded && !isExpanding ? "<br><span>Runs another model pass and adds new observations without deleting existing ones.</span>" : "";
-    const action = `<br><button id="expand-selected" type="button" ${isExpanding ? "disabled" : ""}>${actionLabel}</button><button id="clear-selection" type="button">Clear selection</button>${actionHint}`;
+    const action = `<br><button id="expand-selected" type="button" ${isExpanding ? "disabled" : ""}>${actionLabel}</button><button id="trace-roots-selected" type="button">Trace roots</button><button id="clear-selection" type="button">Clear selection</button>${actionHint}`;
     els.selectedDetails.innerHTML = `<strong>${node.name}</strong><br>Visible incoming: ${incoming}<br>Visible outgoing: ${outgoing}${hiddenLine}<br>Popularity: ${Number(node.weightedPopularity || 0).toFixed(2)} weighted observations<br>Relative size: ${popularityPercent(node)}% of current max${aliases}<br>${stateLabel}${action}`;
     const button = document.querySelector("#expand-selected");
     if (button) {
       button.addEventListener("click", () => expandEntity(node.name).catch(error => setStatus(error.message)));
     }
+    const rootsButton = document.querySelector("#trace-roots-selected");
+    if (rootsButton) rootsButton.addEventListener("click", () => {
+      setPanelTab("roots");
+      renderRootsPanel();
+    });
     const clearButton = document.querySelector("#clear-selection");
     if (clearButton) clearButton.addEventListener("click", clearSelection);
     return;
   }
   const edge = state.edges.get(state.selected.key);
+  if (!edge) {
+    state.selected = null;
+    els.selectedDetails.innerHTML = `Click a node or edge.<br><button id="clear-selection" type="button" disabled>Clear selection</button>`;
+    return;
+  }
   const rows = (edge.observations || []).slice(-8).reverse().map(obs => {
     const when = obs.createdAt ? new Date(obs.createdAt).toLocaleString() : "unknown time";
     const source = obs.sourceEntity ? ` from ${obs.sourceEntity}` : "";
@@ -1669,6 +2264,8 @@ function updateUi() {
   els.expandedCount.textContent = state.expanded.size;
   els.minConfidenceValue.textContent = Number(state.minConfidence).toFixed(2);
   updateSelectedDetails();
+  renderNextPanel();
+  renderRootsPanel();
   if (state.view === "table") renderEntityTable();
 }
 
@@ -1779,6 +2376,10 @@ els.panelTabs.forEach(button => {
         if (els.diagnosticsOutput) els.diagnosticsOutput.textContent = error.message;
         setStatus(error.message);
       });
+    } else if (tab === "roots") {
+      renderRootsPanel();
+    } else if (tab === "next") {
+      renderNextPanel();
     }
   });
 });
@@ -1848,6 +2449,35 @@ els.tableBody.addEventListener("click", event => {
   focusNode(node, 1.15);
 });
 
+if (els.rootsOutput) {
+  els.rootsOutput.addEventListener("click", event => {
+    const button = event.target.closest("[data-root-node]");
+    if (!button) return;
+    const node = state.nodes.get(button.getAttribute("data-root-node"));
+    if (!node) return;
+    state.selected = { type: "node", id: node.id };
+    setView("graph");
+    focusNode(node, 1.15);
+    updateUi();
+  });
+}
+
+if (els.nextOutput) {
+  els.nextOutput.addEventListener("click", event => {
+    const focusButton = event.target.closest("[data-next-node]");
+    const expandButton = event.target.closest("[data-next-expand]");
+    const id = (expandButton || focusButton) && (expandButton || focusButton).getAttribute(expandButton ? "data-next-expand" : "data-next-node");
+    if (!id) return;
+    const node = state.nodes.get(id);
+    if (!node) return;
+    state.selected = { type: "node", id: node.id };
+    setView("graph");
+    focusNode(node, 1.15);
+    updateUi();
+    if (expandButton) expandEntity(node.name).catch(error => setStatus(error.message));
+  });
+}
+
 els.autoExpand.addEventListener("click", () => {
   autoExpandFrontier().catch(error => setStatus(error.message));
 });
@@ -1858,6 +2488,11 @@ els.autoExpand.addEventListener("contextmenu", event => {
 });
 
 els.dedupeReview.addEventListener("click", async () => {
+  const confirmed = window.confirm("Run full identity sweep will call the model across a broad candidate set. Continue?");
+  if (!confirmed) {
+    setStatus("Identity sweep cancelled.");
+    return;
+  }
   const activityId = addActivity("identity", "Full identity sweep", "Model review in progress", "running");
   els.dedupeOutput.textContent = "Running a broader identity sweep and adding decisions to the approval list...";
   try {
@@ -1884,6 +2519,24 @@ els.dedupeReview.addEventListener("click", async () => {
   }
 });
 
+if (els.previewOrphans) {
+  els.previewOrphans.addEventListener("click", () => {
+    previewOrphanNodes().catch(error => {
+      setStatus(error.message);
+      if (els.dedupeOutput) els.dedupeOutput.textContent = error.message;
+    });
+  });
+}
+
+if (els.cleanOrphans) {
+  els.cleanOrphans.addEventListener("click", () => {
+    cleanOrphanNodes().catch(error => {
+      setStatus(error.message);
+      if (els.dedupeOutput) els.dedupeOutput.textContent = error.message;
+    });
+  });
+}
+
 els.identityFilters.forEach(button => {
   button.addEventListener("click", () => {
     state.identityFilter = button.getAttribute("data-identity-filter") || "all";
@@ -1905,6 +2558,11 @@ els.dedupeOutput.addEventListener("click", event => {
 });
 
 els.reset.addEventListener("click", () => {
+  const confirmed = window.confirm("Reset clears the persistent graph in this browser and saves the empty graph. Continue?");
+  if (!confirmed) {
+    setStatus("Reset cancelled.");
+    return;
+  }
   state.nodes.clear();
   state.observations = [];
   state.edges.clear();
@@ -1913,6 +2571,7 @@ els.reset.addEventListener("click", () => {
   state.selected = null;
   state.pan = { x: 0, y: 0 };
   state.zoom = 1;
+  invalidateGraphAnalysis();
   setStatus("Reset.");
   scheduleSave();
   updateUi();

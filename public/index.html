@@ -62,6 +62,8 @@
           </div>
           <div class="panel-tabs" aria-label="Panel sections">
             <button type="button" data-panel-tab="selected" aria-pressed="true">Selected</button>
+            <button type="button" data-panel-tab="next" aria-pressed="false">Next</button>
+            <button type="button" data-panel-tab="roots" aria-pressed="false">Roots</button>
             <button type="button" data-panel-tab="activity" aria-pressed="false">Activity</button>
             <button type="button" data-panel-tab="dedupe" aria-pressed="false" class="dev-only">Identity</button>
             <button type="button" data-panel-tab="diagnostics" aria-pressed="false" class="dev-only">Diagnostics</button>
@@ -70,6 +72,14 @@
           <section class="panel-page" data-panel-page="selected">
             <h2>Selected</h2>
             <div id="selected-details" class="details">Click a node or edge.</div>
+          </section>
+          <section class="panel-page" data-panel-page="next" hidden>
+            <h2>Best Next Expansions</h2>
+            <div id="next-output" class="details next-panel">Calculating local expansion value.</div>
+          </section>
+          <section class="panel-page" data-panel-page="roots" hidden>
+            <h2>Roots</h2>
+            <div id="roots-output" class="details roots-panel">Select an entity to trace its roots.</div>
           </section>
           <section class="panel-page" data-panel-page="activity" hidden>
             <h2>Activity</h2>
@@ -99,6 +109,10 @@
                 <span>Orange arrows are things influenced by the node you hover or select.</span>
               </div>
               <div class="guide-row">
+                <span class="line-swatch root"></span>
+                <span>Purple arrows are upstream root paths for the selected entity.</span>
+              </div>
+              <div class="guide-row">
                 <span class="line-swatch faint"></span>
                 <span>Faint dashed arrows are low-confidence links or links below the current filter.</span>
               </div>
@@ -117,6 +131,9 @@
               <div class="guide-note">
                 Ambiguous names are expanded with nearby graph context so a name discovered from a band, film, or game keeps that intended meaning.
               </div>
+              <div class="guide-note">
+                Best Next Expansions ranks unexpanded entities that look likely to connect clusters, clarify identities, or open useful new neighborhoods.
+              </div>
             </div>
           </section>
           <section class="panel-page dev-only" data-panel-page="dedupe" hidden>
@@ -127,6 +144,12 @@
                 <summary>Advanced sweep</summary>
                 <p>Runs a broader duplicate scan across the current database. Use this occasionally, not as the normal workflow.</p>
                 <button id="dedupe-review" type="button">Run full identity sweep</button>
+              </details>
+              <details class="identity-sweep">
+                <summary>Maintenance</summary>
+                <p>Preview isolated nodes with no observations, then clean them after confirmation.</p>
+                <button id="preview-orphans" type="button">Preview orphan nodes</button>
+                <button id="clean-orphans" type="button" disabled>Clean orphan nodes</button>
               </details>
               <div class="identity-filters" aria-label="Identity decision filters">
                 <button type="button" data-identity-filter="all" aria-pressed="true">All <span>0</span></button>

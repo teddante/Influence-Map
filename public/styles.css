@@ -306,7 +306,7 @@ tbody tr:hover {
   top: -16px;
   z-index: 2;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(74px, 1fr));
   gap: 1px;
   margin: 0 -16px 12px;
   padding: 10px 16px;
@@ -555,6 +555,117 @@ h2 {
   font-size: 12px;
 }
 
+.roots-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.roots-panel h3 {
+  margin: 2px 0 0;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.roots-empty,
+.roots-summary {
+  display: grid;
+  gap: 3px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.roots-summary strong {
+  color: var(--ink);
+}
+
+.roots-list,
+.roots-paths,
+.next-list {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.roots-list li,
+.roots-paths li,
+.next-list li {
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--line);
+}
+
+.roots-list button,
+.next-list button[data-next-node] {
+  width: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--accent);
+  background: transparent;
+  font-weight: 700;
+  text-align: left;
+}
+
+.roots-list span,
+.roots-paths span,
+.next-list span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.next-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.next-list p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.next-list button[data-next-expand] {
+  min-height: 32px;
+  margin-top: 7px;
+}
+
+.next-bars b {
+  background: rgba(20, 108, 92, 0.15);
+}
+
+.roots-paths strong {
+  color: var(--ink);
+}
+
+.metric-bars {
+  display: grid;
+  gap: 3px;
+  margin-top: 5px;
+}
+
+.metric-bars span {
+  position: relative;
+  overflow: hidden;
+  padding: 2px 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fbfbf8;
+}
+
+.metric-bars b {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 0;
+  display: block;
+  background: rgba(119, 77, 172, 0.15);
+}
+
+.metric-bars span {
+  isolation: isolate;
+}
+
 .dedupe-output {
   display: grid;
   gap: 8px;
@@ -634,6 +745,23 @@ h2 {
   background: #fbfbf8;
   font-size: 13px;
   line-height: 1.4;
+}
+
+.orphan-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 20px;
+}
+
+.orphan-list li {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.orphan-list span {
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .dedupe-group {
@@ -922,6 +1050,14 @@ h2 {
 
 .line-swatch.outgoing::after {
   border-left-color: rgba(191, 112, 38, 0.9);
+}
+
+.line-swatch.root::before {
+  background: rgba(119, 77, 172, 0.92);
+}
+
+.line-swatch.root::after {
+  border-left-color: rgba(119, 77, 172, 0.92);
 }
 
 .size-swatch {
