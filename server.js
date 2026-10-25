@@ -1,32 +1,35 @@
-const http = require("http");
-const fs = require("fs");
-const path = require("path");
+const http = require("node:http");
+const fs = require("node:fs");
+const path = require("node:path");
 const { DatabaseSync } = require("node:sqlite");
+const { randomUUID, timingSafeEqual } = require("node:crypto");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { initDb } = require("./lib/schema");
+const { verifiedBackup } = require("./lib/database-backup");
+const { GraphStore, ConflictError } = require("./lib/graph-store");
+const { HttpError, readJson, GenerationBudget } = require("./lib/http-safety");
+const requestContext = new AsyncLocalStorage();
 
-const PORT = Number(process.env.PORT || 3000);
-const PUBLIC_DIR = path.join(__dirname, "public");
-const DATA_FILE = process.env.INFLUENCE_MAP_DATA_FILE || path.join(__dirname, "data", "graph.json");
-const DB_FILE = process.env.INFLUENCE_MAP_DB_FILE || path.join(__dirname, "data", "influence-map.sqlite");
-const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || "";
-const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
-const DEEPSEEK_BASE_URL = process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
-const DEEPSEEK_THINKING = process.env.DEEPSEEK_THINKING || "disabled";
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "google/gemini-3.1-flash-lite-preview";
-const OPENROUTER_BASE_URL = process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
-const OPENROUTER_REASONING = process.env.OPENROUTER_REASONING || "none";
-const DEFAULT_LLM_PROVIDER = (process.env.INFLUENCE_MAP_LLM_PROVIDER || "deepseek").toLowerCase();
-const LLM_MAX_CONCURRENCY = Math.max(1, Number(process.env.INFLUENCE_MAP_LLM_CONCURRENCY || 1) || 1);
-const LLM_REQUEST_TIMEOUT_MS = Math.max(10_000, Number(process.env.INFLUENCE_MAP_LLM_TIMEOUT_MS || 45_000) || 45_000);
-const LLM_MAX_TOKENS = Math.max(0, Number(process.env.INFLUENCE_MAP_LLM_MAX_TOKENS || 0) || 0);
-const IDENTITY_AUTO_APPROVE = process.env.INFLUENCE_MAP_IDENTITY_AUTO_APPROVE !== "0";
-const IDENTITY_AUTO_MERGE_CONFIDENCE = Math.max(0.5, Math.min(1, Number(process.env.INFLUENCE_MAP_AUTO_MERGE_CONFIDENCE || 0.72) || 0.72));
-const IDENTITY_AUTO_SPLIT_CONFIDENCE = Math.max(0.5, Math.min(1, Number(process.env.INFLUENCE_MAP_AUTO_SPLIT_CONFIDENCE || 0.78) || 0.78));
-const DEV_TOOLS = process.env.INFLUENCE_MAP_DEV_TOOLS === "1";
-const ADMIN_TOKEN = process.env.INFLUENCE_MAP_ADMIN_TOKEN || "";
-const profileEvents = [];
-let activeLlmRequests = 0;
-const queuedLlmRequests = [];
+const {
+  PORT, HOST, PUBLIC_DIR, DATA_FILE, DB_FILE, DEV_TOOLS, ADMIN_TOKEN,
+  DEEPSEEK_THINKING, OPENROUTER_REASONING, OPENROUTER_JSON_MODE,
+  DEFAULT_LLM_PROVIDER, LLM_MAX_CONCURRENCY, LLM_REQUEST_TIMEOUT_MS, LLM_MAX_TOKENS,
+  GENERATION_BUDGET, MUTATIONS_PER_MINUTE,
+  IDENTITY_AUTO_APPROVE, IDENTITY_AUTO_MERGE_CONFIDENCE, IDENTITY_AUTO_SPLIT_CONFIDENCE
+} = require("./lib/config");
+const { normalizeName, keyFor } = require("./public/graph-model");
+const {
+  suggestionKey, targetedDedupeCandidates, dedupeCandidates,
+  canonicalFromNames, compatibleTitleVariants, identityConflictReason, looksLikeSpellingVariant,
+  acronymFor, isAcronymLike, compactKey, baseTitleKey, hasDisambiguator, tokenOverlapScore
+} = require("./lib/identity");
+const {
+  providerConfig, createLlmClient, elapsedMs, influenceResponseSchema,
+  identityResponseSchema, dedupeResponseSchema, scopedIdentityResponseSchema
+} = require("./lib/llm-client");
+
+const mutationRequests = new Map();
+const pendingExpansions = new Set();
 
 const mimeTypes = {
   ".html": "text/html; charset=utf-8",
@@ -36,6 +39,7 @@ const mimeTypes = {
 };
 
 function sendJson(res, status, data) {
+  if (res.destroyed || res.writableEnded) return;
   const body = JSON.stringify(data);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
@@ -44,277 +48,7 @@ function sendJson(res, status, data) {
   res.end(body);
 }
 
-function readBody(req, maxBytes = 1_000_000) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", chunk => {
-      body += chunk;
-      if (body.length > maxBytes) {
-        req.destroy();
-        reject(new Error("Request body too large"));
-      }
-    });
-    req.on("end", () => resolve(body));
-    req.on("error", reject);
-  });
-}
-
-function deepSeekRequestBody({ messages, temperature, maxTokens }) {
-  const body = {
-    model: DEEPSEEK_MODEL,
-    messages,
-    response_format: { type: "json_object" },
-    thinking: { type: DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled" },
-    temperature
-  };
-  if (Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
-  return body;
-}
-
-function providerConfig(providerName = DEFAULT_LLM_PROVIDER) {
-  const provider = normalizeName(providerName).toLowerCase();
-  if (provider === "openrouter" || provider === "google") {
-    return {
-      provider: "openrouter",
-      apiKey: OPENROUTER_API_KEY,
-      model: OPENROUTER_MODEL,
-      baseUrl: OPENROUTER_BASE_URL.replace(/\/$/, ""),
-      endpoint: "/chat/completions"
-    };
-  }
-  return {
-    provider: "deepseek",
-    apiKey: DEEPSEEK_API_KEY,
-    model: DEEPSEEK_MODEL,
-    baseUrl: DEEPSEEK_BASE_URL.replace(/\/$/, ""),
-    endpoint: "/chat/completions"
-  };
-}
-
-const influenceResponseSchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    entity: { type: "string" },
-    influencedBy: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          entity: { type: "string" },
-          confidence: { type: "number" }
-        },
-        required: ["entity", "confidence"]
-      }
-    },
-    influenced: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          entity: { type: "string" },
-          confidence: { type: "number" }
-        },
-        required: ["entity", "confidence"]
-      }
-    }
-  },
-  required: ["entity", "influencedBy", "influenced"]
-};
-
-const identityResponseSchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    canonicalName: { type: "string" },
-    displayName: { type: "string" },
-    disambiguation: { type: "string" },
-    aliases: { type: "array", items: { type: "string" } },
-    decision: { type: "string", enum: ["same", "rename", "merge", "split", "new", "uncertain"] },
-    confidence: { type: "number" },
-    reason: { type: "string" }
-  },
-  required: ["canonicalName", "displayName", "disambiguation", "aliases", "decision", "confidence", "reason"]
-};
-
-const dedupeResponseSchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    groups: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          canonical: { type: "string" },
-          entities: { type: "array", items: { type: "string" } },
-          confidence: { type: "number" },
-          reason: { type: "string" }
-        },
-        required: ["canonical", "entities", "confidence", "reason"]
-      }
-    }
-  },
-  required: ["groups"]
-};
-
-const scopedIdentityResponseSchema = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    groups: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          action: { type: "string", enum: ["merge", "split", "keep-separate"] },
-          canonical: { type: "string" },
-          entities: { type: "array", items: { type: "string" } },
-          confidence: { type: "number" },
-          reason: { type: "string" }
-        },
-        required: ["action", "canonical", "entities", "confidence", "reason"]
-      }
-    }
-  },
-  required: ["groups"]
-};
-
-function structuredResponseFormat(name, schema) {
-  return {
-    type: "json_schema",
-    json_schema: {
-      name,
-      strict: true,
-      schema
-    }
-  };
-}
-
-function llmResponseFormat({ responseSchemaName, responseSchema, jsonModeOnly }) {
-  if (jsonModeOnly || !responseSchema) return { type: "json_object" };
-  return structuredResponseFormat(responseSchemaName || "influence_map_response", responseSchema);
-}
-
-function llmRequestBody(config, { messages, temperature, maxTokens, responseSchemaName, responseSchema, jsonModeOnly }) {
-  if (config.provider === "deepseek") return deepSeekRequestBody({ messages, temperature, maxTokens });
-  const body = {
-    model: config.model,
-    messages,
-    response_format: llmResponseFormat({
-      responseSchemaName,
-      responseSchema,
-      jsonModeOnly: typeof jsonModeOnly === "boolean" ? jsonModeOnly : process.env.OPENROUTER_JSON_MODE === "1"
-    }),
-    temperature,
-    reasoning: {
-      effort: OPENROUTER_REASONING,
-      exclude: true
-    }
-  };
-  if (Number.isFinite(maxTokens)) body.max_tokens = maxTokens;
-  return body;
-}
-
-function llmHeaders(config) {
-  const headers = {
-    "content-type": "application/json",
-    "authorization": `Bearer ${config.apiKey}`
-  };
-  if (config.provider === "openrouter") {
-    headers["HTTP-Referer"] = process.env.OPENROUTER_HTTP_REFERER || "http://localhost";
-    headers["X-OpenRouter-Title"] = process.env.OPENROUTER_APP_TITLE || "Influence Map";
-  }
-  return headers;
-}
-
-function acquireLlmSlot() {
-  const started = process.hrtime.bigint();
-  if (activeLlmRequests < LLM_MAX_CONCURRENCY) {
-    activeLlmRequests += 1;
-    return Promise.resolve({ queueMs: elapsedMs(started) });
-  }
-  return new Promise(resolve => {
-    queuedLlmRequests.push(() => {
-      activeLlmRequests += 1;
-      resolve({ queueMs: elapsedMs(started) });
-    });
-  });
-}
-
-function releaseLlmSlot() {
-  activeLlmRequests = Math.max(0, activeLlmRequests - 1);
-  const next = queuedLlmRequests.shift();
-  if (next) next();
-}
-
-async function callChatCompletion(config, prompt, options) {
-  const slot = await acquireLlmSlot();
-  const started = process.hrtime.bigint();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), LLM_REQUEST_TIMEOUT_MS);
-  try {
-    const response = await fetch(`${config.baseUrl}${config.endpoint}`, {
-      method: "POST",
-      headers: llmHeaders(config),
-      signal: controller.signal,
-      body: JSON.stringify(llmRequestBody(config, {
-        messages: prompt.messages,
-        temperature: options.temperature,
-        maxTokens: options.maxTokens,
-        responseSchemaName: options.responseSchemaName,
-        responseSchema: options.responseSchema,
-        jsonModeOnly: options.jsonModeOnly
-      }))
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`${config.provider} ${response.status}: ${text.slice(0, 500)}`);
-    }
-
-    const data = await response.json();
-    const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    return {
-      data,
-      content,
-      usage: usageSummary(data),
-      finishReason: data.choices && data.choices[0] && data.choices[0].finish_reason,
-      ms: elapsedMs(started),
-      queueMs: slot.queueMs,
-      id: data.id || ""
-    };
-  } catch (error) {
-    if (error && error.name === "AbortError") {
-      throw new Error(`${config.provider} request timed out after ${Math.round(LLM_REQUEST_TIMEOUT_MS / 1000)}s`);
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-    releaseLlmSlot();
-  }
-}
-
-function usageSummary(data) {
-  const usage = data && data.usage ? data.usage : {};
-  const details = usage.completion_tokens_details || {};
-  return {
-    promptTokens: usage.prompt_tokens || 0,
-    completionTokens: usage.completion_tokens || 0,
-    totalTokens: usage.total_tokens || 0,
-    reasoningTokens: details.reasoning_tokens || 0
-  };
-}
-
-function normalizeName(name) {
-  return String(name || "")
-    .trim()
-    .replace(/\s+/g, " ");
-}
+function errorStatus(error) { return error.status || (error instanceof SyntaxError ? 400 : 500); }
 
 function clampConfidence(value) {
   const number = Number(value);
@@ -329,14 +63,14 @@ function sanitizeItems(items) {
   for (const item of items) {
     const entity = normalizeName(item && item.entity);
     const key = entity.toLowerCase();
-    if (!entity || seen.has(key)) continue;
+    if (!entity || entity.length > 500 || seen.has(key) || item.confidence === null || !Number.isFinite(Number(item.confidence))) continue;
     seen.add(key);
     clean.push({
       entity,
       confidence: Number(clampConfidence(item.confidence).toFixed(3))
     });
   }
-  return clean;
+  return clean.slice(0, 8);
 }
 
 function sanitizeInfluenceResponse(entity, data) {
@@ -378,109 +112,8 @@ function sanitizeExpansionContext(context) {
   return clean;
 }
 
-function finiteNumber(value, fallback) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function sanitizeGraphData(data) {
-  const minConfidence = data && Object.prototype.hasOwnProperty.call(data, "minConfidence")
-    ? clampConfidence(data.minConfidence)
-    : 0;
-  const savedAtDate = new Date(data && data.savedAt);
-  const savedAt = Number.isFinite(savedAtDate.valueOf()) ? savedAtDate.toISOString() : new Date().toISOString();
-
-  const nodes = [];
-  const nodeById = new Map();
-  for (const node of Array.isArray(data && data.nodes) ? data.nodes : []) {
-    const name = normalizeName(node && node.name);
-    const id = keyFor(name);
-    if (!id) continue;
-    const aliases = Array.isArray(node && node.aliases)
-      ? node.aliases.map(normalizeName).filter(Boolean)
-      : [];
-    if (!nodeById.has(id)) {
-      nodeById.set(id, {
-        id,
-        name,
-        aliases: [],
-        x: finiteNumber(node && node.x, 0),
-        y: finiteNumber(node && node.y, 0)
-      });
-    }
-    const current = nodeById.get(id);
-    for (const alias of [name, ...aliases]) {
-      if (alias && alias !== current.name && !current.aliases.includes(alias)) {
-        current.aliases.push(alias);
-      }
-    }
-  }
-  nodes.push(...[...nodeById.values()].map(node => ({
-    ...node,
-    aliases: node.aliases.slice(0, 12)
-  })));
-  const nameById = new Map(nodes.map(node => [node.id, node.name]));
-
-  const observations = [];
-  for (const observation of Array.isArray(data && data.observations) ? data.observations : []) {
-    const rawFrom = normalizeName(observation && observation.from);
-    const rawTo = normalizeName(observation && observation.to);
-    const fromKey = keyFor(rawFrom);
-    const toKey = keyFor(rawTo);
-    if (!rawFrom || !rawTo || fromKey === toKey) continue;
-    const from = nameById.get(fromKey) || rawFrom;
-    const to = nameById.get(toKey) || rawTo;
-    observations.push({
-      from,
-      to,
-      confidence: Number(clampConfidence(observation.confidence).toFixed(3))
-    });
-  }
-
-  const expanded = [];
-  const seenExpanded = new Set();
-  for (const name of Array.isArray(data && data.expanded) ? data.expanded : []) {
-    const key = keyFor(name);
-    if (!key || seenExpanded.has(key)) continue;
-    seenExpanded.add(key);
-    expanded.push(key);
-  }
-
-  return {
-    version: 1,
-    savedAt,
-    nodes,
-    observations,
-    expanded,
-    pan: {
-      x: finiteNumber(data && data.pan && data.pan.x, 0),
-      y: finiteNumber(data && data.pan && data.pan.y, 0)
-    },
-    zoom: Math.max(0.25, Math.min(3, finiteNumber(data && data.zoom, 1))),
-    minConfidence
-  };
-}
-
-function keyFor(name) {
-  return normalizeName(name)
-    .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/[()[\]{}'"`.,:;!?]/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/^the\s+/, "")
-    .trim();
-}
-
 function nowIso() {
   return new Date().toISOString();
-}
-
-function elapsedMs(start) {
-  return Math.round(Number(process.hrtime.bigint() - start) / 1_000_000);
-}
-
-function configuredMaxTokens() {
-  return LLM_MAX_TOKENS > 0 ? LLM_MAX_TOKENS : undefined;
 }
 
 function recordProfile(event) {
@@ -488,8 +121,6 @@ function recordProfile(event) {
     ...event,
     at: nowIso()
   };
-  profileEvents.unshift(profile);
-  profileEvents.length = Math.min(profileEvents.length, 80);
   try {
     const timings = Array.isArray(profile.timings) ? profile.timings : [];
     const total = timings.find(item => item && item.stage === "total");
@@ -536,112 +167,23 @@ function parseJson(value, fallback) {
   }
 }
 
-function adminTokenFrom(req, url) {
-  return req.headers["x-admin-token"] || url.searchParams.get("admin") || "";
+function adminTokenFrom(req) { return String(req.headers["x-admin-token"] || ""); }
+
+function hasWriteAccess(req) {
+  const given = Buffer.from(adminTokenFrom(req)), expected = Buffer.from(ADMIN_TOKEN);
+  return given.length === expected.length && timingSafeEqual(given, expected);
 }
 
-function hasAdminAccess(req, url) {
-  if (!ADMIN_TOKEN) return DEV_TOOLS;
-  return DEV_TOOLS && adminTokenFrom(req, url) === ADMIN_TOKEN;
-}
+function hasAdminAccess(req) { return DEV_TOOLS && hasWriteAccess(req); }
 
-function requireAdmin(req, res, url) {
-  if (hasAdminAccess(req, url)) return true;
+function requireAdmin(req, res) {
+  if (hasAdminAccess(req)) return true;
   sendJson(res, 403, { error: "Admin access required" });
   return false;
 }
 
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
 const db = new DatabaseSync(DB_FILE);
-
-function initDb() {
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    CREATE TABLE IF NOT EXISTS nodes (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      aliases TEXT NOT NULL DEFAULT '[]',
-      x REAL NOT NULL DEFAULT 0,
-      y REAL NOT NULL DEFAULT 0,
-      expanded INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS observations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      from_id TEXT NOT NULL,
-      to_id TEXT NOT NULL,
-      confidence REAL NOT NULL,
-      source_entity TEXT,
-      provider TEXT,
-      model TEXT,
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_observations_from ON observations(from_id);
-    CREATE INDEX IF NOT EXISTS idx_observations_to ON observations(to_id);
-    CREATE TABLE IF NOT EXISTS dedupe_suggestions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      canonical TEXT NOT NULL,
-      entities TEXT NOT NULL,
-      confidence REAL NOT NULL DEFAULT 0,
-      reason TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'pending',
-      action TEXT NOT NULL DEFAULT 'merge',
-      metadata TEXT NOT NULL DEFAULT '{}',
-      entities_key TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      reviewed_at TEXT
-    );
-    DROP INDEX IF EXISTS idx_dedupe_suggestions_key;
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_dedupe_suggestions_pending_key
-      ON dedupe_suggestions(entities_key)
-      WHERE status = 'pending';
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS llm_profiles (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      event_type TEXT NOT NULL,
-      provider TEXT NOT NULL DEFAULT '',
-      model TEXT NOT NULL DEFAULT '',
-      entity TEXT NOT NULL DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'ok',
-      total_ms INTEGER NOT NULL DEFAULT 0,
-      request_ms INTEGER,
-      queue_ms INTEGER,
-      prompt_tokens INTEGER,
-      completion_tokens INTEGER,
-      reasoning_tokens INTEGER,
-      error TEXT NOT NULL DEFAULT '',
-      event_json TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_llm_profiles_created_at ON llm_profiles(created_at);
-    CREATE INDEX IF NOT EXISTS idx_llm_profiles_status ON llm_profiles(status);
-  `);
-  const suggestionColumns = db.prepare("PRAGMA table_info(dedupe_suggestions)").all().map(row => row.name);
-  if (!suggestionColumns.includes("action")) {
-    db.exec("ALTER TABLE dedupe_suggestions ADD COLUMN action TEXT NOT NULL DEFAULT 'merge'");
-  }
-  if (!suggestionColumns.includes("metadata")) {
-    db.exec("ALTER TABLE dedupe_suggestions ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'");
-  }
-}
-
-function getSetting(key, fallback) {
-  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key);
-  return row ? row.value : fallback;
-}
-
-function setSetting(key, value) {
-  db.prepare(`
-    INSERT INTO settings (key, value)
-    VALUES (?, ?)
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `).run(key, String(value));
-}
 
 function rowToProfile(row) {
   const parsed = parseJson(row.event_json, {});
@@ -692,13 +234,13 @@ function diagnosticSummary() {
     provider: config.apiKey ? config.provider : "mock",
     model: config.apiKey ? config.model : "",
     thinking: config.provider === "openrouter" ? OPENROUTER_REASONING : DEEPSEEK_THINKING === "enabled" ? "enabled" : "disabled",
-    openRouterJsonMode: process.env.OPENROUTER_JSON_MODE === "1",
+    openRouterJsonMode: OPENROUTER_JSON_MODE,
     llmQueue: {
-      active: activeLlmRequests,
-      queued: queuedLlmRequests.length,
+      active: llmQueue.active,
+      queued: llmQueue.queued,
       concurrency: LLM_MAX_CONCURRENCY,
       timeoutMs: LLM_REQUEST_TIMEOUT_MS,
-      maxTokens: configuredMaxTokens() || null
+      maxTokens: LLM_MAX_TOKENS
     },
     counts: diagnosticCounts(),
     profiles: recent,
@@ -707,282 +249,14 @@ function diagnosticSummary() {
   };
 }
 
-function upsertNode(name, options = {}) {
-  const cleanName = normalizeName(name);
-  const id = keyFor(cleanName);
-  if (!id) return null;
-  const existing = db.prepare("SELECT * FROM nodes WHERE id = ?").get(id);
-  const timestamp = nowIso();
-  if (!existing) {
-    db.prepare(`
-      INSERT INTO nodes (id, name, aliases, x, y, expanded, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id,
-      cleanName,
-      JSON.stringify(options.aliases || []),
-      finiteNumber(options.x, 0),
-      finiteNumber(options.y, 0),
-      options.expanded ? 1 : 0,
-      timestamp,
-      timestamp
-    );
-    return id;
-  }
-
-  const aliases = parseJson(existing.aliases, []);
-  for (const alias of [cleanName, ...(options.aliases || [])].map(normalizeName).filter(Boolean)) {
-    if (alias !== existing.name && !aliases.includes(alias)) aliases.push(alias);
-  }
-  db.prepare(`
-    UPDATE nodes
-    SET name = ?,
-        aliases = ?,
-        x = ?,
-        y = ?,
-        expanded = CASE WHEN ? THEN 1 ELSE expanded END,
-        updated_at = ?
-    WHERE id = ?
-  `).run(
-    existing.name || cleanName,
-    JSON.stringify(aliases.slice(0, 20)),
-    Number.isFinite(Number(options.x)) ? Number(options.x) : existing.x,
-    Number.isFinite(Number(options.y)) ? Number(options.y) : existing.y,
-    options.expanded ? 1 : 0,
-    timestamp,
-    id
-  );
-  return id;
-}
-
-function nodeRowsByIds(ids) {
-  const unique = [...new Set(ids.map(keyFor).filter(Boolean))];
-  if (!unique.length) return [];
-  return unique
-    .map(id => db.prepare("SELECT * FROM nodes WHERE id = ?").get(id))
-    .filter(Boolean);
-}
-
-function mergeNodes(canonical, entities) {
-  const canonicalName = normalizeName(canonical);
-  const canonicalId = keyFor(canonicalName);
-  const entityIds = [...new Set((entities || []).map(keyFor).filter(Boolean))];
-  if (!canonicalId || entityIds.length < 2) {
-    throw new Error("Merge needs a canonical name and at least two entities");
-  }
-
-  const rows = nodeRowsByIds([canonicalId, ...entityIds]);
-  if (rows.length < 2) return { changed: false, reason: "Already resolved; fewer than two matching nodes remain" };
-
-  const timestamp = nowIso();
-  const aliases = new Set([canonicalName]);
-  let x = 0;
-  let y = 0;
-  let coordinateCount = 0;
-  let expanded = false;
-
-  for (const row of rows) {
-    aliases.add(row.name);
-    for (const alias of parseJson(row.aliases, [])) aliases.add(alias);
-    if (Number.isFinite(Number(row.x)) && Number.isFinite(Number(row.y))) {
-      x += Number(row.x);
-      y += Number(row.y);
-      coordinateCount += 1;
-    }
-    expanded = expanded || Boolean(row.expanded);
-  }
-
-  upsertNode(canonicalName, {
-    aliases: [...aliases].filter(alias => alias && alias !== canonicalName),
-    x: coordinateCount ? x / coordinateCount : 0,
-    y: coordinateCount ? y / coordinateCount : 0,
-    expanded
-  });
-
-  const idsToMove = rows.map(row => row.id).filter(id => id !== canonicalId);
-  const updateFrom = db.prepare("UPDATE observations SET from_id = ? WHERE from_id = ?");
-  const updateTo = db.prepare("UPDATE observations SET to_id = ? WHERE to_id = ?");
-  const updateSource = db.prepare("UPDATE observations SET source_entity = ? WHERE lower(source_entity) = lower(?)");
-  for (const id of idsToMove) {
-    updateFrom.run(canonicalId, id);
-    updateTo.run(canonicalId, id);
-  }
-  for (const row of rows) {
-    updateSource.run(canonicalName, row.name);
-    for (const alias of parseJson(row.aliases, [])) updateSource.run(canonicalName, alias);
-  }
-  db.prepare("DELETE FROM observations WHERE from_id = to_id").run();
-  for (const id of idsToMove) {
-    db.prepare("DELETE FROM nodes WHERE id = ?").run(id);
-  }
-  db.prepare("UPDATE nodes SET name = ?, aliases = ?, expanded = ?, updated_at = ? WHERE id = ?").run(
-    canonicalName,
-    JSON.stringify([...aliases].filter(alias => alias && alias !== canonicalName).slice(0, 40)),
-    expanded ? 1 : 0,
-    timestamp,
-    canonicalId
-  );
-  return {
-    changed: Boolean(idsToMove.length),
-    reason: idsToMove.length ? `Merged ${idsToMove.length} node${idsToMove.length === 1 ? "" : "s"}` : "Already canonical"
-  };
-}
-
-function renameNodeInDb(source, canonical) {
-  const sourceName = normalizeName(source);
-  const canonicalName = normalizeName(canonical);
-  const sourceId = keyFor(sourceName);
-  const canonicalId = keyFor(canonicalName);
-  if (!sourceId || !canonicalId || !sourceName || !canonicalName) {
-    throw new Error("Rename needs a source and canonical name");
-  }
-  if (sourceId === canonicalId) {
-    const row = db.prepare("SELECT * FROM nodes WHERE id = ?").get(sourceId);
-    if (!row || row.name === canonicalName) return { changed: false, reason: "Already named correctly" };
-    const aliases = new Set(parseJson(row.aliases, []));
-    aliases.add(row.name);
-    db.prepare("UPDATE nodes SET name = ?, aliases = ?, updated_at = ? WHERE id = ?").run(
-      canonicalName,
-      JSON.stringify([...aliases].filter(alias => alias && alias !== canonicalName).slice(0, 40)),
-      nowIso(),
-      sourceId
-    );
-    db.prepare("UPDATE observations SET source_entity = ? WHERE lower(source_entity) = lower(?)").run(canonicalName, sourceName);
-    return { changed: true, reason: `Renamed ${sourceName} to ${canonicalName}` };
-  }
-  return mergeNodes(canonicalName, [sourceName, canonicalName]);
-}
-
-function approveSplitSuggestion(suggestion) {
-  const parsed = rowToSuggestion(suggestion);
-  return applySplitDecision(parsed);
-}
-
-function applySplitDecision(parsed) {
-  const metadata = parsed.metadata || {};
-  const ids = Array.isArray(metadata.moveObservationIds)
-    ? metadata.moveObservationIds.map(Number).filter(Number.isFinite)
-    : [];
-  if (!ids.length) return { changed: false, moved: 0, reason: "No movable links were attached to this split review" };
-
-  const sourceId = keyFor(parsed.entities[0]);
-  const canonicalKey = keyFor(parsed.canonical);
-  const sourceRow = sourceId ? db.prepare("SELECT * FROM nodes WHERE id = ?").get(sourceId) : null;
-  const canonicalExists = canonicalKey ? db.prepare("SELECT id FROM nodes WHERE id = ?").get(canonicalKey) : null;
-  const canonicalId = upsertNode(parsed.canonical, canonicalExists ? {} : {
-    x: sourceRow ? Number(sourceRow.x) + 36 : 0,
-    y: sourceRow ? Number(sourceRow.y) + 36 : 0
-  });
-  if (!canonicalId || !sourceId || canonicalId === sourceId) return { changed: false, moved: 0, reason: "Split target is already the source node" };
-
-  const updateFrom = db.prepare("UPDATE observations SET from_id = ? WHERE id = ? AND from_id = ?");
-  const updateTo = db.prepare("UPDATE observations SET to_id = ? WHERE id = ? AND to_id = ?");
-  const updateSource = db.prepare("UPDATE observations SET source_entity = ? WHERE id = ? AND lower(source_entity) = lower(?)");
-  let moved = 0;
-  for (const id of ids) {
-    const fromResult = updateFrom.run(canonicalId, id, sourceId);
-    const toResult = updateTo.run(canonicalId, id, sourceId);
-    const changes = fromResult.changes + toResult.changes;
-    if (changes) updateSource.run(parsed.canonical, id, parsed.entities[0]);
-    moved += changes;
-  }
-  db.prepare("DELETE FROM observations WHERE from_id = to_id").run();
-  return {
-    changed: moved > 0,
-    moved,
-    reason: moved > 0 ? `Moved ${moved} link${moved === 1 ? "" : "s"}` : "Already resolved; no listed links still belong to the source node"
-  };
-}
-
-function graphFromDb() {
-  const nodes = db.prepare("SELECT * FROM nodes ORDER BY name COLLATE NOCASE").all().map(row => ({
-    id: row.id,
-    name: row.name,
-    aliases: parseJson(row.aliases, []),
-    x: row.x,
-    y: row.y
-  }));
-  const nameById = new Map(nodes.map(node => [node.id, node.name]));
-  const observations = db.prepare("SELECT * FROM observations ORDER BY id").all().map(row => ({
-    id: row.id,
-    from: nameById.get(row.from_id) || row.from_id,
-    to: nameById.get(row.to_id) || row.to_id,
-    confidence: row.confidence,
-    sourceEntity: row.source_entity || "",
-    provider: row.provider || "",
-    model: row.model || "",
-    createdAt: row.created_at
-  }));
-  return {
-    version: 2,
-    savedAt: getSetting("savedAt", nowIso()),
-    nodes,
-    observations,
-    expanded: db.prepare("SELECT id FROM nodes WHERE expanded = 1 ORDER BY name COLLATE NOCASE").all().map(row => row.id),
-    pan: parseJson(getSetting("pan", ""), { x: 0, y: 0 }),
-    zoom: Number(getSetting("zoom", "1")) || 1,
-    minConfidence: clampConfidence(getSetting("minConfidence", "0"))
-  };
-}
-
-function writeGraphToDb(data, options = {}) {
-  const graph = sanitizeGraphData(data);
-  const timestamp = nowIso();
-  try {
-    db.exec("BEGIN");
-    db.exec("DELETE FROM observations; DELETE FROM nodes;");
-    const touchedNames = new Set();
-    for (const node of graph.nodes) {
-      touchedNames.add(node.name);
-      for (const alias of node.aliases || []) touchedNames.add(alias);
-      upsertNode(node.name, {
-        aliases: node.aliases,
-        x: node.x,
-        y: node.y,
-        expanded: graph.expanded.includes(node.id)
-      });
-    }
-    const insertObservation = db.prepare(`
-      INSERT INTO observations (from_id, to_id, confidence, source_entity, provider, model, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    for (const observation of Array.isArray(data && data.observations) ? data.observations : graph.observations) {
-      const fromId = upsertNode(observation.from);
-      const toId = upsertNode(observation.to);
-      if (!fromId || !toId || fromId === toId) continue;
-      touchedNames.add(observation.from);
-      touchedNames.add(observation.to);
-      if (observation.sourceEntity) touchedNames.add(observation.sourceEntity);
-      insertObservation.run(
-        fromId,
-        toId,
-        Number(clampConfidence(observation.confidence).toFixed(3)),
-        normalizeName(observation.sourceEntity || ""),
-        normalizeName(observation.provider || ""),
-        normalizeName(observation.model || ""),
-        normalizeName(observation.createdAt || "") || timestamp
-      );
-    }
-    setSetting("savedAt", timestamp);
-    setSetting("pan", JSON.stringify(graph.pan));
-    setSetting("zoom", graph.zoom);
-    setSetting("minConfidence", graph.minConfidence);
-    db.exec("COMMIT");
-    if (options.runIdentityHygiene) localIdentityHygiene([...touchedNames]);
-  } catch (error) {
-    db.exec("ROLLBACK");
-    throw error;
-  }
-  return graphFromDb();
-}
-
 function migrateJsonToDb() {
+  if (store.setting("legacyMigrationComplete") === "1") return;
   const hasRows = db.prepare("SELECT COUNT(*) AS count FROM nodes").get().count > 0;
-  if (hasRows || !fs.existsSync(DATA_FILE)) return;
-  const raw = fs.readFileSync(DATA_FILE, "utf8").replace(/^\uFEFF/, "");
-  const graph = sanitizeGraphData(JSON.parse(raw));
-  writeGraphToDb(graph, { runIdentityHygiene: true });
-  console.log(`Migrated ${graph.nodes.length} nodes and ${graph.observations.length} observations to ${DB_FILE}`);
+  if (!hasRows && fs.existsSync(DATA_FILE)) {
+    const graph = JSON.parse(fs.readFileSync(DATA_FILE, "utf8").replace(/^\uFEFF/, ""));
+    store.importGraph(graph);
+  }
+  store.setSetting("legacyMigrationComplete", "1");
 }
 
 function mockInfluences(entity) {
@@ -999,7 +273,7 @@ function mockInfluences(entity) {
       influenced: [
         ["PUBG: Battlegrounds", 0.74],
         ["Fortnite Battle Royale", 0.46],
-        ["Rust", 0.57],
+        ["Rust (video game)", 0.57],
         ["H1Z1", 0.69],
         ["Escape from Tarkov", 0.42]
       ]
@@ -1072,7 +346,7 @@ function buildInfluenceMessages(entity, context = {}) {
     "After resolving the intended entity, include a compact useful set of broader significant influences and things influenced by it, including relationships not already present in the context.",
     "Avoid returning only the supplied context relationships unless no other confident relationships are known.",
     "Do not invent, pad, or force relationships just to make the graph grow; empty or small arrays are acceptable when confidence is low.",
-    "Confidence is an estimated probability from 0 to 1.",
+    "Confidence is an uncalibrated model judgment score from 0 to 1; source verification is recorded separately.",
     "Use any kind of cultural entity: people, works, media, scenes, styles, technologies, or movements.",
     "Do not include explanations, sources, markdown, comments, or extra keys.",
     "Return at most 8 influencedBy items and at most 8 influenced items.",
@@ -1227,7 +501,7 @@ async function callIdentityResolution(entity, context = {}, config = providerCon
   const prompt = buildIdentityMessages(entity, context);
   const result = await callChatCompletion(config, prompt, {
     temperature: 0.1,
-    maxTokens: configuredMaxTokens(),
+    maxTokens: LLM_MAX_TOKENS,
     responseSchemaName: "identity_resolution",
     responseSchema: identityResponseSchema
   });
@@ -1267,11 +541,11 @@ function buildPromptBundle(stages) {
   };
 }
 
-async function callDeepSeek(entity, context = {}, config = providerConfig()) {
+async function callInfluenceGeneration(entity, context = {}, config = providerConfig()) {
   const prompt = buildInfluenceMessages(entity, context);
   const result = await callChatCompletion(config, prompt, {
     temperature: 0.55,
-    maxTokens: configuredMaxTokens(),
+    maxTokens: LLM_MAX_TOKENS,
     responseSchemaName: "influence_expansion",
     responseSchema: influenceResponseSchema
   });
@@ -1321,7 +595,7 @@ async function callDedupeReview(candidates, config = providerConfig()) {
 
   const result = await callChatCompletion(config, prompt, {
     temperature: 0.1,
-    maxTokens: configuredMaxTokens(),
+    maxTokens: LLM_MAX_TOKENS,
     responseSchemaName: "dedupe_review",
     responseSchema: dedupeResponseSchema
   });
@@ -1343,7 +617,7 @@ async function callDedupeReview(candidates, config = providerConfig()) {
 }
 
 function scopedDedupeCandidates(names = []) {
-  return targetedDedupeCandidates(names).slice(0, 12);
+  return targetedDedupeCandidates(nodesForIdentityScan(), names).slice(0, 12);
 }
 
 function buildScopedIdentityMessages(names, candidates) {
@@ -1397,7 +671,7 @@ async function callScopedIdentityReview(names, candidates, config = providerConf
 
   const result = await callChatCompletion(config, prompt, {
     temperature: 0.1,
-    maxTokens: configuredMaxTokens(),
+    maxTokens: LLM_MAX_TOKENS,
     responseSchemaName: "scoped_identity_review",
     responseSchema: scopedIdentityResponseSchema
   });
@@ -1411,10 +685,6 @@ async function callScopedIdentityReview(names, candidates, config = providerConf
     requestMs: result.ms,
     queueMs: result.queueMs
   };
-}
-
-function suggestionKey(entities) {
-  return [...new Set((entities || []).map(keyFor).filter(Boolean))].sort().join("|");
 }
 
 function rowToSuggestion(row) {
@@ -1444,7 +714,7 @@ function pendingDedupeSuggestions() {
 function storeDedupeSuggestions(groups) {
   const timestamp = nowIso();
   const existingPending = db.prepare(`
-    SELECT id FROM dedupe_suggestions
+    SELECT id, action, confidence, metadata FROM dedupe_suggestions
     WHERE entities_key = ? AND status = 'pending'
   `);
   const update = db.prepare(`
@@ -1474,6 +744,7 @@ function storeDedupeSuggestions(groups) {
     const action = ["merge", "identity", "split", "rename"].includes(group.action) ? group.action : "merge";
     const metadata = JSON.stringify(group.metadata || {});
     const existing = existingPending.get(key);
+    if (existing && reason.startsWith("Local heuristic:") && parseJson(existing.metadata, {}).automatedReview) continue;
     if (existing) {
       update.run(canonical, serialized, confidence, reason, action, metadata, timestamp, existing.id);
     } else {
@@ -1546,126 +817,9 @@ function expansionIdentityGroup(requestedEntity, canonicalEntity, context = {}, 
   };
 }
 
-function storeExpansionIdentitySuggestion(requestedEntity, canonicalEntity, context = {}, identity = null) {
-  const group = expansionIdentityGroup(requestedEntity, canonicalEntity, context, identity);
-  return group ? storeDedupeSuggestions([group]) : 0;
-}
-
-function canonicalFromNames(names) {
-  const sorted = [...names].sort((a, b) => {
-    const acronymA = acronymFor(a) === keyFor(a);
-    const acronymB = acronymFor(b) === keyFor(b);
-    if (acronymA !== acronymB) return acronymA ? 1 : -1;
-    return b.length - a.length || a.localeCompare(b);
-  });
-  return sorted[0] || names[0] || "";
-}
-
-function identityKind(name) {
-  const key = keyFor(name);
-  const kinds = new Set();
-  if (/\bfilm\b|\bmovie\b/.test(key)) kinds.add("film");
-  if (/\bvideo game\b|\bgame\b/.test(key)) kinds.add("game");
-  if (/\bfranchise\b/.test(key)) kinds.add("franchise");
-  if (/\btv series\b|\btelevision series\b/.test(key)) kinds.add("tv-series");
-  else if (/\bseries\b/.test(key)) kinds.add("series");
-  if (/\balbum\b/.test(key)) kinds.add("album");
-  if (/\bnovel\b|\bbook\b/.test(key)) kinds.add("book");
-  if (/\bband\b/.test(key)) kinds.add("band");
-  if (!kinds.has("tv-series") && /\btv\b|\btelevision\b/.test(key)) kinds.add("television");
-  return kinds;
-}
-
-function identityYears(name) {
-  return [...keyFor(name).matchAll(/\b(19|20)\d{2}\b/g)].map(match => match[0]);
-}
-
-function compatibleTitleVariants(names) {
-  const clean = (names || []).map(normalizeName).filter(Boolean);
-  if (clean.length < 2) return false;
-  const base = baseTitleKey(clean[0]);
-  if (!base || clean.some(name => baseTitleKey(name) !== base)) return false;
-
-  const yearSets = clean.map(identityYears).filter(years => years.length);
-  const years = new Set(yearSets.flat());
-  if (yearSets.length > 1 && years.size > 1) return false;
-
-  const kindSets = clean.map(identityKind);
-  const explicitKinds = kindSets.filter(set => set.size);
-  if (!explicitKinds.length) return false;
-  const allKinds = new Set(explicitKinds.flatMap(set => [...set]));
-  if ((allKinds.has("series") || allKinds.has("franchise")) && allKinds.size > 1) return false;
-
-  const compatiblePairs = [
-    ["film"],
-    ["game"],
-    ["album"],
-    ["book"],
-    ["band"],
-    ["tv-series"],
-    ["television"]
-  ];
-  return compatiblePairs.some(group => {
-    const allowed = new Set(group);
-    return explicitKinds.every(set => [...set].every(kind => allowed.has(kind)));
-  });
-}
-
-function identityConflictReason(names = []) {
-  const clean = (names || []).map(normalizeName).filter(Boolean);
-  const kindSets = clean.map(identityKind);
-  const explicitKinds = kindSets.filter(set => set.size);
-  const allKinds = new Set(explicitKinds.flatMap(set => [...set]));
-  if ((allKinds.has("series") || allKinds.has("franchise")) && allKinds.size > 1) {
-    return "series/franchise mixed with a specific work";
-  }
-
-  const yearSets = clean.map(identityYears).filter(years => years.length);
-  const years = new Set(yearSets.flat());
-  if (yearSets.length > 1 && years.size > 1) {
-    return "conflicting years";
-  }
-
-  const bases = new Set(clean.map(baseTitleKey).filter(Boolean));
-  if (bases.size === 1 && clean.some(hasDisambiguator) && !compatibleTitleVariants(clean)) {
-    return "same title but incompatible disambiguators";
-  }
-  return "";
-}
-
-function editDistance(a, b) {
-  const left = String(a || "");
-  const right = String(b || "");
-  if (left === right) return 0;
-  if (!left) return right.length;
-  if (!right) return left.length;
-  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
-  const current = Array(right.length + 1).fill(0);
-  for (let i = 1; i <= left.length; i += 1) {
-    current[0] = i;
-    for (let j = 1; j <= right.length; j += 1) {
-      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
-      current[j] = Math.min(
-        previous[j] + 1,
-        current[j - 1] + 1,
-        previous[j - 1] + cost
-      );
-    }
-    for (let j = 0; j <= right.length; j += 1) previous[j] = current[j];
-  }
-  return previous[right.length];
-}
-
-function looksLikeSpellingVariant(a, b) {
-  const left = compactKey(baseTitleKey(a) || a);
-  const right = compactKey(baseTitleKey(b) || b);
-  if (left.length < 6 || right.length < 6) return false;
-  const distance = editDistance(left, right);
-  return distance <= 2 || distance / Math.max(left.length, right.length) <= 0.18;
-}
-
 function canAutoApplyIdentity(group) {
   if (!IDENTITY_AUTO_APPROVE || !group) return { ok: false, reason: "automatic identity approval disabled" };
+  if (String(group.reason || "").startsWith("Local heuristic:")) return { ok: false, reason: "heuristic candidates require manual identity review" };
   const action = group.action === "split" ? "split" : group.action === "merge" || group.action === "rename" ? "merge" : "";
   if (!action) return { ok: false, reason: "not an actionable identity edit" };
   const entities = [...new Set((group.entities || []).map(normalizeName).filter(Boolean))];
@@ -1707,15 +861,10 @@ function applyAutoIdentityGroups(groups = []) {
       });
       continue;
     }
-    db.exec("BEGIN");
     try {
-      const result = group.action === "split"
-        ? applySplitDecision(group)
-        : group.action === "rename"
-          ? renameNodeInDb(group.entities[0], group.canonical)
-          : mergeNodes(group.canonical, group.entities);
-      db.exec("COMMIT");
+      const { result, eventId } = store.edit(group);
       applied.push({
+        eventId,
         action: group.action,
         canonical: group.canonical,
         entities: group.entities,
@@ -1724,7 +873,6 @@ function applyAutoIdentityGroups(groups = []) {
         result
       });
     } catch (error) {
-      db.exec("ROLLBACK");
       queued.push({
         ...group,
         metadata: {
@@ -1734,9 +882,6 @@ function applyAutoIdentityGroups(groups = []) {
         reason: `${group.reason || "LLM identity decision"}; queued because automatic apply failed: ${error.message}`
       });
     }
-  }
-  if (applied.length) {
-    setSetting("savedAt", nowIso());
   }
   return { applied, queued, skipped };
 }
@@ -1751,47 +896,13 @@ function localDedupeSuggestions(candidates) {
     .filter(candidate => trustedReasons.has(candidate.reason)
       || (candidate.reason === "same base title with disambiguator" && compatibleTitleVariants(candidate.entities)))
     .map(candidate => ({
+      action: "merge",
       canonical: canonicalFromNames(candidate.entities || []),
       entities: candidate.entities || [],
       confidence: candidate.reason.includes("base title") ? 0.68 : 0.72,
       reason: `Local heuristic: ${candidate.reason}`
     }))
     .filter(group => group.canonical && group.entities.length > 1);
-}
-
-function targetedTitleVariantCandidates(names = []) {
-  const touched = new Set((names || []).map(keyFor).filter(Boolean));
-  if (!touched.size) return [];
-  const nodes = db.prepare("SELECT id, name FROM nodes ORDER BY name COLLATE NOCASE").all();
-  const byBase = new Map();
-  for (const node of nodes) {
-    const base = baseTitleKey(node.name);
-    if (!base || !hasDisambiguator(node.name)) continue;
-    const bucket = byBase.get(base) || [];
-    bucket.push(node);
-    byBase.set(base, bucket);
-  }
-
-  const groups = new Map();
-  for (const bucket of byBase.values()) {
-    for (let i = 0; i < bucket.length; i += 1) {
-      for (let j = i + 1; j < bucket.length; j += 1) {
-        const a = bucket[i];
-        const b = bucket[j];
-        if (!touched.has(a.id) && !touched.has(b.id)) continue;
-        if (!compatibleTitleVariants([a.name, b.name])) continue;
-        const entities = [a.name, b.name];
-        const key = suggestionKey(entities);
-        if (!groups.has(key)) {
-          groups.set(key, {
-            reason: "same base title with compatible disambiguators",
-            entities
-          });
-        }
-      }
-    }
-  }
-  return [...groups.values()];
 }
 
 function nodesForIdentityScan() {
@@ -1807,113 +918,9 @@ function nodesForIdentityScan() {
     });
 }
 
-function targetedDedupeCandidates(names = []) {
-  const inputNames = [...new Set((names || []).map(normalizeName).filter(Boolean))];
-  const touchedKeys = new Set(inputNames.map(keyFor).filter(Boolean));
-  if (!touchedKeys.size) return [];
-
-  const nodes = nodesForIdentityScan();
-  const knownKeys = new Set();
-  for (const node of nodes) {
-    knownKeys.add(node.id);
-    for (const name of node.allNames) knownKeys.add(keyFor(name));
-  }
-  for (const name of inputNames) {
-    const key = keyFor(name);
-    if (!key || knownKeys.has(key)) continue;
-    nodes.push({
-      id: key,
-      name,
-      aliases: [],
-      allNames: [name]
-    });
-    knownKeys.add(key);
-  }
-
-  const touchedNodes = nodes.filter(node => touchedKeys.has(node.id)
-    || node.allNames.some(name => touchedKeys.has(keyFor(name))));
-  if (!touchedNodes.length) return targetedTitleVariantCandidates(names);
-
-  const groups = new Map();
-  function add(reason, items) {
-    const uniqueById = new Map();
-    for (const item of items || []) {
-      if (item && item.id && item.name) uniqueById.set(item.id, item);
-    }
-    const namesForKey = [...uniqueById.values()].map(item => item.name);
-    if (namesForKey.length < 2) return;
-    const key = namesForKey.map(keyFor).sort().join("|");
-    if (!groups.has(key)) groups.set(key, { reason, entities: namesForKey });
-  }
-
-  const seenPairs = new Set();
-  for (const touched of touchedNodes) {
-    for (const node of nodes) {
-      if (touched.id === node.id) continue;
-      const pairKey = [touched.id, node.id].sort().join("|");
-      if (seenPairs.has(pairKey)) continue;
-      seenPairs.add(pairKey);
-
-      const touchedNames = touched.allNames.length ? touched.allNames : [touched.name];
-      const nodeNames = node.allNames.length ? node.allNames : [node.name];
-      const bestNames = [touched.name, node.name];
-
-      if (touched.id.replace(/s$/, "") === node.id.replace(/s$/, "")) {
-        add("same normalized singular form", [touched, node]);
-      }
-
-      if (touched.id.length >= 4 && node.id.length >= 4 && (touched.id.includes(node.id) || node.id.includes(touched.id))) {
-        add("one normalized name contains the other", [touched, node]);
-      }
-
-      for (const touchedName of touchedNames) {
-        for (const nodeName of nodeNames) {
-          const touchedCompact = compactKey(touchedName);
-          const nodeCompact = compactKey(nodeName);
-          if (touchedCompact.length >= 5 && touchedCompact === nodeCompact) {
-            add("same compact punctuation-free form", [touched, node]);
-          }
-          if (isAcronymLike(touchedName) && acronymFor(nodeName) === keyFor(touchedName)) {
-            add("exact acronym-name match", [touched, node]);
-          }
-          if (isAcronymLike(nodeName) && acronymFor(touchedName) === keyFor(nodeName)) {
-            add("exact acronym-name match", [touched, node]);
-          }
-          if (tokenOverlapScore(touchedName, nodeName) >= 0.8) {
-            add("high token overlap", [touched, node]);
-          }
-          if (hasDisambiguator(touchedName)
-            && hasDisambiguator(nodeName)
-            && baseTitleKey(touchedName) === baseTitleKey(nodeName)
-            && compatibleTitleVariants([touchedName, nodeName])) {
-            add("same base title with compatible disambiguators", [touched, node]);
-          }
-          if (hasDisambiguator(touchedName) && baseTitleKey(touchedName) === keyFor(nodeName)) {
-            add("same base title with disambiguator", [touched, node]);
-          }
-          if (hasDisambiguator(nodeName) && baseTitleKey(nodeName) === keyFor(touchedName)) {
-            add("same base title with disambiguator", [touched, node]);
-          }
-        }
-      }
-
-      if (compatibleTitleVariants(bestNames)) {
-        add("same base title with compatible disambiguators", [touched, node]);
-      }
-    }
-  }
-
-  for (const candidate of targetedTitleVariantCandidates(names)) {
-    const key = (candidate.entities || []).map(keyFor).sort().join("|");
-    if (key && !groups.has(key)) groups.set(key, candidate);
-  }
-
-  return [...groups.values()].slice(0, 80);
-}
-
 function localIdentityHygiene(names = []) {
   try {
-    const autoIdentity = applyAutoIdentityGroups(localDedupeSuggestions(targetedDedupeCandidates(names)));
+    const autoIdentity = applyAutoIdentityGroups(localDedupeSuggestions(targetedDedupeCandidates(nodesForIdentityScan(), names)));
     return autoIdentity.applied.length + storeDedupeSuggestions(autoIdentity.queued);
   } catch (error) {
     console.warn(`Local identity hygiene skipped: ${error.message}`);
@@ -1959,36 +966,18 @@ function namesFromInfluenceResponse(entity, data) {
   ].map(normalizeName).filter(Boolean);
 }
 
-function storeScopedIdentityGroups(groups) {
-  const actionable = [];
-  for (const group of groups || []) {
-    if (group.action === "keep-separate") continue;
-    actionable.push({
-      canonical: group.canonical,
-      entities: group.entities,
-      confidence: group.confidence,
-      action: group.action === "split" ? "identity" : "merge",
-      metadata: {
-        llmAction: group.action,
-        automatedReview: true
-      },
-      reason: `LLM scoped identity: ${group.reason || group.action}`
-    });
-  }
-  return storeDedupeSuggestions(actionable);
-}
-
 function actionableScopedIdentityGroups(groups) {
   const actionable = [];
   for (const group of groups || []) {
     if (group.action === "keep-separate") continue;
-    if (group.action === "split") continue;
+    // Preserve scoped split decisions for exact-link review instead of dropping them.
     actionable.push({
       canonical: group.canonical,
       entities: group.entities,
       confidence: group.confidence,
-      action: "merge",
+      action: group.action === "split" ? "split" : "merge",
       metadata: {
+        needsLinkReview: group.action === "split",
         llmAction: group.action,
         automatedReview: true
       },
@@ -1998,127 +987,6 @@ function actionableScopedIdentityGroups(groups) {
   return actionable;
 }
 
-function acronymFor(name) {
-  return normalizeName(name)
-    .split(/\s+/)
-    .filter(part => !["the", "a", "an", "of", "and"].includes(part.toLowerCase()))
-    .map(part => part[0])
-    .join("")
-    .toLowerCase();
-}
-
-function isAcronymLike(name) {
-  const key = keyFor(name);
-  return /^[a-z0-9]{2,8}$/.test(key) && key === compactKey(name);
-}
-
-function compactKey(name) {
-  return keyFor(name).replace(/\s+/g, "");
-}
-
-function baseTitleKey(name) {
-  return keyFor(name)
-    .replace(/\b(19|20)\d{2}s?\b/g, " ")
-    .replace(/\bfilm\b|\bmovie\b|\bvideo game\b|\bgame\b|\balbum\b|\bnovel\b|\bbook\b|\bseries\b|\bfranchise\b|\btv\b|\btelevision\b/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function hasDisambiguator(name) {
-  return /[(),:]|\b(19|20)\d{2}s?\b|\bfilm\b|\bmovie\b|\bvideo game\b|\bgame\b|\balbum\b|\bnovel\b|\bbook\b|\bseries\b|\bfranchise\b|\btv\b|\btelevision\b/i.test(name);
-}
-
-function dedupeTokens(name) {
-  return keyFor(name)
-    .split(/\s+/)
-    .map(token => token.replace(/s$/, ""))
-    .filter(token => token && !["the", "a", "an", "of", "and", "or", "for", "game", "video", "s"].includes(token));
-}
-
-function tokenOverlapScore(a, b) {
-  const aTokens = new Set(dedupeTokens(a));
-  const bTokens = new Set(dedupeTokens(b));
-  if (!aTokens.size || !bTokens.size) return 0;
-  let shared = 0;
-  for (const token of aTokens) {
-    if (bTokens.has(token)) shared += 1;
-  }
-  return shared / Math.min(aTokens.size, bTokens.size);
-}
-
-function dedupeCandidatesFromDb(limit = 500) {
-  const nodes = db.prepare("SELECT id, name, aliases FROM nodes ORDER BY name COLLATE NOCASE").all()
-    .map(row => ({
-      id: row.id,
-      name: row.name,
-      aliases: parseJson(row.aliases, []),
-      allNames: [row.name, ...parseJson(row.aliases, [])].map(normalizeName).filter(Boolean)
-    }));
-  const groups = new Map();
-
-  function add(reason, items) {
-    const names = [...new Set(items.map(item => item.name).filter(Boolean))];
-    if (names.length < 2) return;
-    const key = names.map(keyFor).sort().join("|");
-    if (!groups.has(key)) groups.set(key, { reason, entities: names });
-  }
-
-  const byNoPlural = new Map();
-  const byCompact = new Map();
-  const byBaseTitle = new Map();
-  for (const node of nodes) {
-    const singular = node.id.replace(/s$/, "");
-    const bucket = byNoPlural.get(singular) || [];
-    bucket.push(node);
-    byNoPlural.set(singular, bucket);
-
-    for (const name of node.allNames) {
-      const compact = compactKey(name);
-      if (compact.length >= 5) {
-        const compactBucket = byCompact.get(compact) || [];
-        compactBucket.push(node);
-        byCompact.set(compact, compactBucket);
-      }
-
-      const baseTitle = baseTitleKey(name);
-      if (baseTitle && baseTitle !== keyFor(name) && hasDisambiguator(name)) {
-        const baseBucket = byBaseTitle.get(baseTitle) || [];
-        baseBucket.push(node);
-        byBaseTitle.set(baseTitle, baseBucket);
-      }
-    }
-  }
-  for (const bucket of byNoPlural.values()) add("same normalized singular form", bucket);
-  for (const bucket of byCompact.values()) add("same compact punctuation-free form", bucket);
-  for (const [baseTitle, bucket] of byBaseTitle) {
-    const exactBase = nodes.find(node => node.id === baseTitle);
-    add("same base title with disambiguator", exactBase ? [exactBase, ...bucket] : bucket);
-  }
-
-  for (let i = 0; i < nodes.length; i += 1) {
-    for (let j = i + 1; j < nodes.length; j += 1) {
-      const a = nodes[i];
-      const b = nodes[j];
-      if (a.id.length < 4 || b.id.length < 4) continue;
-      if (a.id.includes(b.id) || b.id.includes(a.id)) add("one normalized name contains the other", [a, b]);
-      if (isAcronymLike(a.name) && acronymFor(b.name) === a.id) add("exact acronym-name match", [a, b]);
-      if (isAcronymLike(b.name) && acronymFor(a.name) === b.id) add("exact acronym-name match", [a, b]);
-      if (tokenOverlapScore(a.name, b.name) >= 0.8) add("high token overlap", [a, b]);
-      if (hasDisambiguator(a.name)
-        && hasDisambiguator(b.name)
-        && baseTitleKey(a.name) === baseTitleKey(b.name)
-        && compatibleTitleVariants([a.name, b.name])) {
-        add("same base title with compatible disambiguators", [a, b]);
-      }
-      if (hasDisambiguator(a.name) && baseTitleKey(a.name) === b.id) add("same base title with disambiguator", [a, b]);
-      if (hasDisambiguator(b.name) && baseTitleKey(b.name) === a.id) add("same base title with disambiguator", [a, b]);
-    }
-  }
-
-  const values = [...groups.values()];
-  return Number.isFinite(limit) ? values.slice(0, limit) : values;
-}
-
 async function handleApiInfluences(req, res) {
   const started = process.hrtime.bigint();
   const timings = [];
@@ -2126,27 +994,30 @@ async function handleApiInfluences(req, res) {
   let generationEntity = "";
   let config = providerConfig(DEFAULT_LLM_PROVIDER);
   let identityResult = null;
+  let requestId;
+  let ownsRequest = false;
   try {
-    const raw = await readBody(req);
-    const body = raw ? JSON.parse(raw) : {};
+    const body = await readJson(req);
     entity = normalizeName(body.entity);
+    if (entity.length > 500) throw new HttpError(400, "Entity name is too long");
+    requestId = String(body.requestId || randomUUID());
+    if (requestId.length > 100) throw new HttpError(400, "Invalid request ID");
+    const cached = store.expansion(requestId);
+    if (cached) {
+      if (cached.requestedEntity && cached.requestedEntity !== entity) throw new ConflictError("Request ID belongs to another entity");
+      return sendJson(res, 200, { ...cached, ...store.changesSince(body.revision) });
+    }
+    if (pendingExpansions.has(requestId)) throw new ConflictError("This expansion is already running");
+    if (body.revision !== undefined) store.assertRevision(body.revision);
+    pendingExpansions.add(requestId);
+    ownsRequest = true;
     const context = sanitizeExpansionContext(body.context);
     config = providerConfig(body.provider || DEFAULT_LLM_PROVIDER);
-    const provider = config.provider;
     if (!entity) return sendJson(res, 400, { error: "Missing entity" });
 
-    if (provider === "mock") {
-      return sendJson(res, 200, {
-        provider: "mock",
-        model: "local-demo",
-        data: mockInfluences(entity)
-      });
-    }
-
-    if (!config.apiKey) {
-      return sendJson(res, 503, {
-        error: `Live generation is not configured. Start the server with ${provider === "openrouter" ? "OPENROUTER_API_KEY" : "DEEPSEEK_API_KEY"} or use mock mode in dev tools.`
-      });
+    if (config.provider === "mock") {
+      const response = store.appendExpansion(requestId, { provider: "mock", model: "local-demo", requestedEntity: entity, data: mockInfluences(entity) });
+      return sendJson(res, 200, { ...response, ...store.changesSince(body.revision) });
     }
 
     const identityPlan = shouldResolveIdentity(entity, context);
@@ -2161,14 +1032,18 @@ async function handleApiInfluences(req, res) {
     }
 
     const expansionStage = process.hrtime.bigint();
-    const result = await callDeepSeek(generationEntity, context, config);
+    const result = await callInfluenceGeneration(generationEntity, context, config);
     timings.push({ stage: "expansion", ms: elapsedMs(expansionStage) });
+    store.appendExpansion(requestId, { provider: config.provider, model: config.model, requestedEntity: entity, data: result.data });
     const touchedNames = namesFromInfluenceResponse(entity, result.data);
     const identityEditStage = process.hrtime.bigint();
     const scopedCandidates = scopedDedupeCandidates(touchedNames);
     const hygieneQueued = scopedCandidates.length > 0;
     const scopedReview = hygieneQueued
-      ? await callScopedIdentityReview(touchedNames, scopedCandidates, config)
+      ? await callScopedIdentityReview(touchedNames, scopedCandidates, config).catch(error => {
+        recordProfile({ type: "identity-hygiene-error", entity, provider: config.provider, model: config.model, error: error.message });
+        return { groups: [], warning: error.message };
+      })
       : { groups: [], prompt: null };
     const expansionIdentity = expansionIdentityGroup(entity, result.data.entity, context, identityResult && identityResult.data);
     const scopedGroups = actionableScopedIdentityGroups(scopedReview.groups);
@@ -2184,6 +1059,29 @@ async function handleApiInfluences(req, res) {
       ...timings,
       { stage: "total", ms: elapsedMs(started) }
     ];
+    const modelDetails = {
+      llm: {
+        identityQueueMs: identityResult && identityResult.queueMs,
+        identityRequestMs: identityResult && identityResult.requestMs,
+        hygieneQueueMs: scopedReview.queueMs,
+        hygieneRequestMs: scopedReview.requestMs,
+        expansionQueueMs: result.queueMs,
+        expansionRequestMs: result.requestMs,
+        concurrency: LLM_MAX_CONCURRENCY,
+        timeoutMs: LLM_REQUEST_TIMEOUT_MS,
+        maxTokens: LLM_MAX_TOKENS
+      },
+      usage: {
+        identity: identityResult && identityResult.usage,
+        expansion: result.usage,
+        hygiene: scopedReview.usage
+      },
+      finishReason: {
+        identity: identityResult && identityResult.finishReason,
+        expansion: result.finishReason,
+        hygiene: scopedReview.finishReason
+      }
+    };
     recordProfile({
       type: "expand",
       entity,
@@ -2197,27 +1095,7 @@ async function handleApiInfluences(req, res) {
       autoIdentityQueued: autoIdentity.queued.length,
       scopedCandidates: scopedCandidates.length,
       timings: responseTimings,
-      llm: {
-        identityQueueMs: identityResult && identityResult.queueMs,
-        identityRequestMs: identityResult && identityResult.requestMs,
-        hygieneQueueMs: scopedReview.queueMs,
-        hygieneRequestMs: scopedReview.requestMs,
-        expansionQueueMs: result.queueMs,
-        expansionRequestMs: result.requestMs,
-        concurrency: LLM_MAX_CONCURRENCY,
-        timeoutMs: LLM_REQUEST_TIMEOUT_MS,
-        maxTokens: configuredMaxTokens() || null
-      },
-      usage: {
-        identity: identityResult && identityResult.usage,
-        expansion: result.usage,
-        hygiene: scopedReview.usage
-      },
-      finishReason: {
-        identity: identityResult && identityResult.finishReason,
-        expansion: result.finishReason,
-        hygiene: scopedReview.finishReason
-      }
+      ...modelDetails
     });
     const response = {
       provider: config.provider,
@@ -2226,6 +1104,7 @@ async function handleApiInfluences(req, res) {
       identity: identityResult ? identityResult.data : null,
       identityCandidates: identityPlan.candidates,
       scopedIdentityReview: {
+        warning: scopedReview.warning || null,
         candidates: scopedCandidates.length,
         groups: scopedReview.groups,
         queued: hygieneQueued
@@ -2236,31 +1115,11 @@ async function handleApiInfluences(req, res) {
       autoIdentityApplied: autoIdentity.applied.length,
       autoIdentity,
       hygieneQueued,
-      usage: {
-        identity: identityResult && identityResult.usage,
-        expansion: result.usage,
-        hygiene: scopedReview.usage
-      },
-      llm: {
-        identityQueueMs: identityResult && identityResult.queueMs,
-        identityRequestMs: identityResult && identityResult.requestMs,
-        hygieneQueueMs: scopedReview.queueMs,
-        hygieneRequestMs: scopedReview.requestMs,
-        expansionQueueMs: result.queueMs,
-        expansionRequestMs: result.requestMs,
-        concurrency: LLM_MAX_CONCURRENCY,
-        timeoutMs: LLM_REQUEST_TIMEOUT_MS,
-        maxTokens: configuredMaxTokens() || null
-      },
-      finishReason: {
-        identity: identityResult && identityResult.finishReason,
-        expansion: result.finishReason,
-        hygiene: scopedReview.finishReason
-      },
-      graph: autoIdentity.applied.length ? graphFromDb() : null,
+      ...modelDetails,
+      ...store.changesSince(body.revision),
       timings: responseTimings
     };
-    if (hasAdminAccess(req, new URL(req.url, `http://${req.headers.host}`))) {
+    if (hasAdminAccess(req)) {
       response.debugPrompt = buildPromptBundle({
         identity: identityResult && identityResult.prompt,
         expansion: result.prompt,
@@ -2285,22 +1144,23 @@ async function handleApiInfluences(req, res) {
         identityQueueMs: identityResult && identityResult.queueMs,
         identityRequestMs: identityResult && identityResult.requestMs,
         concurrency: LLM_MAX_CONCURRENCY,
-        active: activeLlmRequests,
-        queued: queuedLlmRequests.length,
+        active: llmQueue.active,
+        queued: llmQueue.queued,
         timeoutMs: LLM_REQUEST_TIMEOUT_MS,
-        maxTokens: configuredMaxTokens() || null
+        maxTokens: LLM_MAX_TOKENS
       },
       error: error.message || "Influence generation failed"
     });
-    sendJson(res, 500, { error: error.message || "Influence generation failed" });
+    sendJson(res, errorStatus(error), { error: error.message || "Influence generation failed" });
+  } finally {
+    if (ownsRequest) pendingExpansions.delete(requestId);
   }
 }
 
-async function handleApiInfluencePrompt(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiInfluencePrompt(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
-    const raw = await readBody(req);
-    const body = raw ? JSON.parse(raw) : {};
+    const body = await readJson(req);
     const entity = normalizeName(body.entity);
     const context = sanitizeExpansionContext(body.context);
     if (!entity) return sendJson(res, 400, { error: "Missing entity" });
@@ -2314,51 +1174,20 @@ async function handleApiInfluencePrompt(req, res, url) {
       identityWillRun: identityPlan.shouldResolve
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Prompt preview failed" });
+    sendJson(res, errorStatus(error), { error: error.message || "Prompt preview failed" });
   }
 }
 
-async function readGraphData() {
-  return graphFromDb();
+async function handleApiGraph(req, res, url) {
+  if (req.method !== "GET") return sendJson(res, 405, { error: "Whole-graph writes were removed. Use the authenticated mutation endpoints." });
+  return sendJson(res, 200, url.searchParams.has("since") ? store.changesSince(Number(url.searchParams.get("since"))) : { data: store.graph() });
 }
 
-async function writeGraphData(data) {
-  return writeGraphToDb(data, { runIdentityHygiene: false });
-}
-
-async function normalizeGraphFile() {
-  const graph = graphFromDb();
-  writeGraphToDb(graph, { runIdentityHygiene: true });
-  console.log(`Normalized SQLite graph data at ${DB_FILE}`);
-}
-
-async function handleApiGraph(req, res) {
-  try {
-    if (req.method === "GET") {
-      return sendJson(res, 200, {
-        data: await readGraphData()
-      });
-    }
-
-    if (req.method === "PUT") {
-      const raw = await readBody(req, 10_000_000);
-      const body = raw ? JSON.parse(raw) : {};
-      return sendJson(res, 200, {
-        data: await writeGraphData(body)
-      });
-    }
-
-    return sendJson(res, 405, { error: "Method not allowed" });
-  } catch (error) {
-    sendJson(res, 500, { error: error.message || "Graph persistence failed" });
-  }
-}
-
-async function handleApiDedupeReview(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiDedupeReview(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
     const config = providerConfig(DEFAULT_LLM_PROVIDER);
-    const candidates = dedupeCandidatesFromDb();
+    const candidates = dedupeCandidates(nodesForIdentityScan());
     const review = await callDedupeReview(candidates, config);
     const localGroups = localDedupeSuggestions(candidates);
     const autoIdentity = applyAutoIdentityGroups([...localGroups, ...review.groups.map(group => ({ ...group, action: group.action || "merge" }))]);
@@ -2374,33 +1203,33 @@ async function handleApiDedupeReview(req, res, url) {
       model: config.apiKey ? config.model : "",
       generatedAt: nowIso()
     };
-    if (hasAdminAccess(req, url)) response.debugPrompt = review.prompt;
+    if (hasAdminAccess(req)) response.debugPrompt = review.prompt;
     sendJson(res, 200, response);
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Dedupe review failed" });
+    sendJson(res, errorStatus(error), { error: error.message || "Dedupe review failed" });
   }
 }
 
-async function handleApiDedupeSuggestions(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiDedupeSuggestions(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
     sendJson(res, 200, { suggestions: pendingDedupeSuggestions() });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Could not load dedupe suggestions" });
+    sendJson(res, errorStatus(error), { error: error.message || "Could not load dedupe suggestions" });
   }
 }
 
-async function handleApiDedupeAutoResolve(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiDedupeAutoResolve(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
     const autoIdentity = autoResolvePendingIdentity();
     sendJson(res, 200, {
       suggestions: pendingDedupeSuggestions(),
       autoIdentity,
-      data: autoIdentity.applied ? graphFromDb() : null
+      data: autoIdentity.applied ? store.graph() : null
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Could not auto-resolve dedupe suggestions" });
+    sendJson(res, errorStatus(error), { error: error.message || "Could not auto-resolve dedupe suggestions" });
   }
 }
 
@@ -2422,65 +1251,56 @@ function orphanNodes() {
   }));
 }
 
-async function handleApiOrphans(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiOrphans(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
     if (req.method === "GET") {
       return sendJson(res, 200, { orphans: orphanNodes() });
     }
     if (req.method === "DELETE") {
+      const body = await readJson(req);
       const orphans = orphanNodes();
-      const remove = db.prepare("DELETE FROM nodes WHERE id = ?");
-      db.exec("BEGIN");
-      try {
-        for (const orphan of orphans) remove.run(orphan.id);
-        setSetting("savedAt", nowIso());
-        db.exec("COMMIT");
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
-      return sendJson(res, 200, {
-        removed: orphans.length,
-        orphans,
-        data: graphFromDb()
-      });
+      const mutation = store.mutate("orphan-cleanup", { names: orphans.map(node => node.name) }, () => {
+        const remove = db.prepare("DELETE FROM nodes WHERE id=?");
+        for (const node of orphans) remove.run(node.id);
+      }, { expectedRevision: body.revision });
+      return sendJson(res, 200, { removed: orphans.length, eventId: mutation.eventId, ...store.changesSince(body.revision) });
     }
     return sendJson(res, 405, { error: "Method not allowed" });
   } catch (error) {
-    return sendJson(res, 500, { error: error.message || "Orphan cleanup failed" });
+    return sendJson(res, errorStatus(error), { error: error.message || "Orphan cleanup failed" });
   }
 }
 
-async function handleApiProfiles(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiProfiles(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
     sendJson(res, 200, {
       profiles: recentProfiles(80),
       llmQueue: {
-        active: activeLlmRequests,
-        queued: queuedLlmRequests.length,
+        active: llmQueue.active,
+        queued: llmQueue.queued,
         concurrency: LLM_MAX_CONCURRENCY,
         timeoutMs: LLM_REQUEST_TIMEOUT_MS
       },
       generatedAt: nowIso()
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Could not load profiles" });
+    sendJson(res, errorStatus(error), { error: error.message || "Could not load profiles" });
   }
 }
 
-async function handleApiDiagnostics(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiDiagnostics(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
     sendJson(res, 200, diagnosticSummary());
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "Could not load diagnostics" });
+    sendJson(res, errorStatus(error), { error: error.message || "Could not load diagnostics" });
   }
 }
 
-async function handleApiLlmBenchmark(req, res, url) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiLlmBenchmark(req, res) {
+  if (!requireAdmin(req, res)) return;
   try {
     const config = providerConfig(DEFAULT_LLM_PROVIDER);
     if (!config.apiKey) return sendJson(res, 503, { error: `No API key configured for ${config.provider}` });
@@ -2505,7 +1325,7 @@ async function handleApiLlmBenchmark(req, res, url) {
       const started = process.hrtime.bigint();
       const result = await callChatCompletion(config, prompt, {
         temperature: 0.1,
-        maxTokens: configuredMaxTokens(),
+        maxTokens: LLM_MAX_TOKENS,
         responseSchemaName: "benchmark_influence",
         responseSchema: influenceResponseSchema,
         jsonModeOnly: mode.jsonModeOnly
@@ -2534,7 +1354,7 @@ async function handleApiLlmBenchmark(req, res, url) {
           expansionRequestMs: result.ms,
           concurrency: LLM_MAX_CONCURRENCY,
           timeoutMs: LLM_REQUEST_TIMEOUT_MS,
-          maxTokens: configuredMaxTokens() || null
+          maxTokens: LLM_MAX_TOKENS
         },
         usage: {
           expansion: result.usage
@@ -2552,72 +1372,39 @@ async function handleApiLlmBenchmark(req, res, url) {
       generatedAt: nowIso()
     });
   } catch (error) {
-    sendJson(res, 500, { error: error.message || "LLM benchmark failed" });
+    sendJson(res, errorStatus(error), { error: error.message || "LLM benchmark failed" });
   }
 }
 
-async function handleApiDedupeDecision(req, res, url, id, decision) {
-  if (!requireAdmin(req, res, url)) return;
+async function handleApiDedupeDecision(req, res, id, decision) {
+  if (!requireAdmin(req, res)) return;
   try {
-    const suggestion = db.prepare("SELECT * FROM dedupe_suggestions WHERE id = ?").get(id);
-    if (!suggestion) return sendJson(res, 404, { error: "Suggestion not found" });
-    if (suggestion.status !== "pending") return sendJson(res, 409, { error: "Suggestion has already been reviewed" });
-
-    const timestamp = nowIso();
-    let decisionResult = { changed: false, reason: decision === "approve" ? "Marked reviewed" : "Rejected" };
+    const body = await readJson(req);
+    store.assertRevision(body.revision);
+    const suggestion = db.prepare("SELECT * FROM dedupe_suggestions WHERE id=?").get(id);
+    if (!suggestion) throw new HttpError(404, "Suggestion not found");
+    if (suggestion.status !== "pending") throw new ConflictError("Suggestion has already been reviewed");
+    let result = { changed: false, reason: "Rejected" };
+    let eventId = null;
     if (decision === "approve") {
-      db.exec("BEGIN");
-      let touchedNames = [];
-      try {
-        const parsed = rowToSuggestion(suggestion);
-        touchedNames = [parsed.canonical, ...parsed.entities];
-        if (parsed.action === "merge") {
-          decisionResult = mergeNodes(parsed.canonical, parsed.entities);
-          setSetting("savedAt", timestamp);
-        } else if (parsed.action === "split") {
-          decisionResult = approveSplitSuggestion(suggestion);
-          setSetting("savedAt", timestamp);
-        } else {
-          decisionResult = { changed: false, reason: "Identity check marked reviewed" };
-        }
-        db.prepare(`
-          UPDATE dedupe_suggestions
-          SET status = 'approved', updated_at = ?, reviewed_at = ?
-          WHERE id = ?
-        `).run(timestamp, timestamp, id);
-        db.exec("COMMIT");
-        localIdentityHygiene(touchedNames);
-      } catch (error) {
-        db.exec("ROLLBACK");
-        throw error;
-      }
-    } else {
-      db.prepare(`
-        UPDATE dedupe_suggestions
-        SET status = 'rejected', updated_at = ?, reviewed_at = ?
-        WHERE id = ?
-      `).run(timestamp, timestamp, id);
+      const group = rowToSuggestion(suggestion);
+      if (Array.isArray(body.moveObservationIds)) group.metadata.moveObservationIds = body.moveObservationIds;
+      if (["merge", "split", "rename"].includes(group.action)) ({ result, eventId } = store.edit(group, body.revision));
+      else result = { changed: false, reason: "Identity check marked reviewed" };
     }
-
-    sendJson(res, 200, {
-      suggestions: pendingDedupeSuggestions(),
-      data: graphFromDb(),
-      result: decisionResult
-    });
-  } catch (error) {
-    sendJson(res, 500, { error: error.message || "Dedupe decision failed" });
-  }
+    db.prepare("UPDATE dedupe_suggestions SET status=?,reviewed_at=?,updated_at=? WHERE id=?").run(decision === "approve" ? "approved" : "rejected", nowIso(), nowIso(), id);
+    sendJson(res, 200, { suggestions: pendingDedupeSuggestions(), ...store.changesSince(body.revision), result, eventId });
+  } catch (error) { sendJson(res, errorStatus(error), { error: error.message }); }
 }
 
-function serveStatic(req, res) {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+function serveStatic(req, res, url) {
   const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname;
-  const safePath = path
-    .normalize(decodeURIComponent(requestedPath))
-    .replace(/^(\.\.[/\\])+/, "");
-  const filePath = path.join(PUBLIC_DIR, safePath.replace(/^[/\\]/, ""));
+  let decoded;
+  try { decoded = decodeURIComponent(requestedPath); } catch { throw new HttpError(400, "Malformed URL encoding"); }
+  if (decoded.includes("\0")) throw new HttpError(400, "Malformed file path");
+  const filePath = path.resolve(PUBLIC_DIR, `.${decoded.replace(/\\/g, "/")}`);
 
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  if (!filePath.startsWith(PUBLIC_DIR + path.sep)) {
     res.writeHead(403);
     res.end("Forbidden");
     return;
@@ -2635,60 +1422,78 @@ function serveStatic(req, res) {
   });
 }
 
-initDb();
+verifiedBackup(db, DB_FILE);
+initDb(db);
+const store = new GraphStore(db);
 migrateJsonToDb();
+const generationBudget = new GenerationBudget(store, GENERATION_BUDGET);
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  if (req.method === "POST" && url.pathname === "/api/influences") {
-    handleApiInfluences(req, res);
-    return;
+const { callChatCompletion, llmQueue } = createLlmClient(generationBudget, requestContext);
+
+function securityHeaders(res) {
+  res.setHeader("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  res.setHeader("cache-control", "no-store");
+}
+
+const routes = new Map([
+  ["POST /api/influences", handleApiInfluences],
+  ["POST /api/influence-prompt", handleApiInfluencePrompt],
+  ["GET /api/graph", handleApiGraph],
+  ["PUT /api/graph", handleApiGraph],
+  ["POST /api/dedupe-review", handleApiDedupeReview],
+  ["GET /api/dedupe-suggestions", handleApiDedupeSuggestions],
+  ["POST /api/dedupe-auto-resolve", handleApiDedupeAutoResolve],
+  ["GET /api/orphans", handleApiOrphans],
+  ["DELETE /api/orphans", handleApiOrphans],
+  ["GET /api/profiles", handleApiProfiles],
+  ["GET /api/diagnostics", handleApiDiagnostics],
+  ["POST /api/llm-benchmark", handleApiLlmBenchmark],
+]);
+
+async function dispatch(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  if (url.pathname.startsWith("/api/") && req.method !== "GET") {
+    if (pendingExpansions.size && /(?:reset|history|dedupe|orphans)/.test(url.pathname)) throw new ConflictError("Wait for active expansions before editing graph identities");
+    if (!hasWriteAccess(req)) throw new HttpError(403, "Write access required. Open the private access link from the server terminal.");
+    if (req.headers.origin && req.headers.origin !== "http://" + req.headers.host) throw new HttpError(403, "Cross-origin mutation rejected");
+    const minute = Math.floor(Date.now() / 60000);
+    const key = req.socket.remoteAddress;
+    const rate = mutationRequests.get(key);
+    const count = rate?.minute === minute ? rate.count + 1 : 1;
+    mutationRequests.set(key, { minute, count });
+    for (const [address, entry] of mutationRequests) if (entry.minute < minute) mutationRequests.delete(address);
+    if (count > MUTATIONS_PER_MINUTE) throw new HttpError(429, "Mutation rate limit reached; retry next minute");
   }
-  if (req.method === "POST" && url.pathname === "/api/influence-prompt") {
-    handleApiInfluencePrompt(req, res, url);
-    return;
+  if (req.method === "POST" && url.pathname === "/api/reset") {
+    const body = await readJson(req);
+    const result = store.reset(body.revision);
+    return sendJson(res, 200, { ...result, ...store.changesSince(body.revision) });
   }
-  if ((req.method === "GET" || req.method === "PUT") && url.pathname === "/api/graph") {
-    handleApiGraph(req, res);
-    return;
+  if (req.method === "GET" && url.pathname === "/api/history") {
+    if (!requireAdmin(req, res)) return;
+    return sendJson(res, 200, { history: store.history(), revision: store.revision });
   }
-  if (req.method === "POST" && url.pathname === "/api/dedupe-review") {
-    handleApiDedupeReview(req, res, url);
-    return;
+  const undo = url.pathname.match(/^\/api\/history\/(\d+)\/undo$/);
+  if (req.method === "POST" && undo) {
+    if (!requireAdmin(req, res)) return;
+    const body = await readJson(req);
+    const result = store.undo(Number(undo[1]), body.revision);
+    return sendJson(res, 200, { ...result, ...store.changesSince(body.revision) });
   }
-  if (req.method === "GET" && url.pathname === "/api/dedupe-suggestions") {
-    handleApiDedupeSuggestions(req, res, url);
-    return;
-  }
-  if (req.method === "POST" && url.pathname === "/api/dedupe-auto-resolve") {
-    handleApiDedupeAutoResolve(req, res, url);
-    return;
-  }
-  if ((req.method === "GET" || req.method === "DELETE") && url.pathname === "/api/orphans") {
-    handleApiOrphans(req, res, url);
-    return;
-  }
-  if (req.method === "GET" && url.pathname === "/api/profiles") {
-    handleApiProfiles(req, res, url);
-    return;
-  }
-  if (req.method === "GET" && url.pathname === "/api/diagnostics") {
-    handleApiDiagnostics(req, res, url);
-    return;
-  }
-  if (req.method === "POST" && url.pathname === "/api/llm-benchmark") {
-    handleApiLlmBenchmark(req, res, url);
-    return;
-  }
+  const handler = routes.get(req.method + " " + url.pathname);
+  if (handler) return handler(req, res, url);
   const decisionMatch = url.pathname.match(/^\/api\/dedupe-suggestions\/(\d+)\/(approve|reject)$/);
   if (req.method === "POST" && decisionMatch) {
-    handleApiDedupeDecision(req, res, url, Number(decisionMatch[1]), decisionMatch[2]);
-    return;
+    return handleApiDedupeDecision(req, res, Number(decisionMatch[1]), decisionMatch[2]);
   }
   if (req.method === "GET" && url.pathname === "/api/config") {
     const config = providerConfig(DEFAULT_LLM_PROVIDER);
     sendJson(res, 200, {
-      devTools: hasAdminAccess(req, url),
+      devTools: hasAdminAccess(req),
+      canWrite: hasWriteAccess(req),
+      revision: store.revision,
       adminRequired: DEV_TOOLS && Boolean(ADMIN_TOKEN),
       provider: config.apiKey ? config.provider : "mock",
       model: config.apiKey ? config.model : "",
@@ -2697,16 +1502,25 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === "GET") {
-    serveStatic(req, res);
+    serveStatic(req, res, url);
     return;
   }
   res.writeHead(405);
   res.end("Method not allowed");
+}
+
+const server = http.createServer((req, res) => {
+  securityHeaders(res);
+  const cancellation = new AbortController();
+  res.on("close", () => { if (!res.writableEnded) cancellation.abort(); });
+  requestContext.run({ signal: cancellation.signal }, () => {
+    dispatch(req, res).catch(error => sendJson(res, errorStatus(error), { error: error.message || "Request failed" }));
+  });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   const config = providerConfig(DEFAULT_LLM_PROVIDER);
-  console.log(`Influence graph running at http://localhost:${PORT}`);
+  console.log(`Influence graph running at http://${HOST}:${server.address().port}`);
+  if (!process.env.INFLUENCE_MAP_ADMIN_TOKEN) console.log(`Private write access: http://${HOST}:${server.address().port}/?admin=${ADMIN_TOKEN}`);
   console.log(config.apiKey ? `Using ${config.provider}/${config.model}` : `No API key set for ${config.provider}; using mock mode`);
-  normalizeGraphFile();
 });

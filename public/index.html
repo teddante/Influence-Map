@@ -11,7 +11,7 @@
       <section class="toolbar" aria-label="Graph controls">
         <div class="brand">
           <h1>Influence Map</h1>
-          <p>Generate a living graph of what influenced what.</p>
+          <p>Explore proposed influences and their model sample history.</p>
         </div>
         <form id="expand-form" class="search">
           <input id="entity-input" autocomplete="off" placeholder="Start with DayZ, Joy Division, Dune..." value="DayZ">
@@ -23,15 +23,15 @@
             <button id="table-view" type="button" aria-pressed="false">Table</button>
           </div>
           <label>
-            <span>Min confidence</span>
+            <span>Min mean sample score</span>
             <input id="min-confidence" type="range" min="0" max="1" step="0.01" value="0">
             <strong id="min-confidence-value">0.00</strong>
           </label>
-          <label class="dev-only">
-            <span>Auto budget</span>
+          <label class="dev-only" title="How many top-ranked unexpanded entities to queue when you run the next-best expansion batch.">
+            <span>Batch size</span>
             <input id="auto-budget" type="number" min="1" max="10" value="3">
           </label>
-          <button id="auto-expand" class="dev-only" type="button">Auto expand frontier</button>
+          <button id="auto-expand" class="dev-only" type="button" title="Queue the current highest-value unexpanded entities from the Next panel.">Expand next best</button>
           <button id="reset-graph" class="dev-only" type="button">Reset</button>
         </div>
       </section>
@@ -44,6 +44,7 @@
         </div>
         <aside class="panel">
           <div class="status" id="status">Ready.</div>
+          <p class="guide-note">Links are generated suggestions. Model scores are uncalibrated; repeated samples measure consistency. Source support is recorded separately. Prominence and upstream rankings depend on this map's coverage.</p>
           <div class="metrics">
             <div><span>Entities</span><strong id="node-count">0</strong></div>
             <div><span>Edges</span><strong id="edge-count">0</strong></div>
@@ -120,7 +121,15 @@
                 <span class="size-swatch">
                   <i></i><b></b>
                 </span>
-                <span>Larger circles appear more often in confident observations.</span>
+                <span>Larger circles have higher graph prominence from observations, unique links, and repeated evidence.</span>
+              </div>
+              <div class="guide-row">
+                <span class="ring-swatch expanded-ring"></span>
+                <span>Outer rings show expanded entities.</span>
+              </div>
+              <div class="guide-row">
+                <span class="ring-swatch ambiguity-ring"></span>
+                <span>Dotted red rings flag names that may need identity clarification.</span>
               </div>
               <div class="guide-note">
                 Search focuses existing entities. If none is found, the app generates one new neighborhood and connects it to the map.
@@ -134,12 +143,20 @@
               <div class="guide-note">
                 Best Next Expansions ranks unexpanded entities that look likely to connect clusters, clarify identities, or open useful new neighborhoods.
               </div>
+              <div class="guide-note">
+                Batch size controls how many ranked entities the dev expansion button queues. The batch runs one after another so identity merges and graph saves stay consistent.
+              </div>
             </div>
           </section>
           <section class="panel-page dev-only" data-panel-page="dedupe" hidden>
             <h2>Identity Review</h2>
             <div class="details identity-review-panel">
-              <p class="identity-review-copy">Expansion automatically asks the model to handle nearby merges, renames, splits, and keep-separate cases. This panel is now mainly an audit and fallback for anything automatic handling could not safely apply.</p>
+                <p class="identity-review-copy">Review proposed merges, renames, and splits here. Automatic application is off by default. Splits require exact sample IDs. Identity edits keep an undo snapshot; undo is available until another graph mutation occurs.</p>
+                <details class="identity-sweep">
+                  <summary>Edit history and undo</summary>
+                  <button id="load-history" type="button">Refresh history</button>
+                  <div id="history-output">Load the recent graph edit history.</div>
+                </details>
               <details class="identity-sweep">
                 <summary>Advanced sweep</summary>
                 <p>Runs a broader duplicate scan across the current database. Use this occasionally, not as the normal workflow.</p>
@@ -157,7 +174,7 @@
                 <button type="button" data-identity-filter="split" aria-pressed="false">Splits <span>0</span></button>
                 <button type="button" data-identity-filter="identity" aria-pressed="false">Checks <span>0</span></button>
               </div>
-              <div id="dedupe-output" class="dedupe-output">Automatic identity handling is on. Unresolved fallback decisions appear here only if the system cannot safely apply them.</div>
+              <div id="dedupe-output" class="dedupe-output">Open this tab to load pending identity decisions.</div>
             </div>
           </section>
           <section class="panel-page dev-only" data-panel-page="diagnostics" hidden>
@@ -177,7 +194,7 @@
           <div class="table-header">
             <div>
               <h2>Entities</h2>
-              <p>Sort the graph by connection count, observations, popularity, or expansion state.</p>
+              <p>Sort the graph by connection count, observations, prominence, or expansion state.</p>
             </div>
             <input id="table-filter" autocomplete="off" placeholder="Filter entities...">
           </div>
@@ -190,7 +207,7 @@
                   <th><button type="button" data-sort="incoming">Incoming</button></th>
                   <th><button type="button" data-sort="outgoing">Outgoing</button></th>
                   <th><button type="button" data-sort="observations">Observations</button></th>
-                  <th><button type="button" data-sort="popularity">Popularity</button></th>
+                  <th><button type="button" data-sort="popularity">Prominence</button></th>
                   <th><button type="button" data-sort="expanded">State</button></th>
                 </tr>
               </thead>
@@ -210,6 +227,7 @@
         <div id="prompt-modal-content" class="prompt-view"></div>
       </section>
     </div>
+    <script src="/graph-model.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

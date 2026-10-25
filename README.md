@@ -1,143 +1,139 @@
-﻿# Influence Map
+# Influence Map
 
-Influence Map is a tiny prototype for exploring cultural influence as a generated graph. Start from an entity, expand what influenced it and what it influenced, and let repeated observations average into confidence-weighted edges.
+A local tool for exploring proposed cultural influences as a directed graph. Arrows point from an influencer to something influenced. The graph retains individual model samples, their scores, and available provenance.
 
-## Features
+Model scores are uncalibrated judgments. Repeating a model call measures consistency, and prominence reflects this map's sampling history. Upstream paths and rankings are heuristics whose results depend on coverage, depth limits and cycles. They do not establish historical causation. Source links and evidence type are stored separately; missing provenance stays `unknown`.
 
-- Minimal Node server with no runtime dependencies
-- Static canvas-based graph UI
-- DeepSeek native API support via OpenAI-compatible chat completions
-- JSON structured output using `response_format: { "type": "json_object" }`
-- Mock mode when no API key is configured
-- Observation averaging for repeated entity-to-entity relationships
-- Frontier auto-expansion with a call budget
-- Simple LLM cost estimator
-- Server-side graph persistence to a local JSON file
-- SQLite graph storage with JSON migration on first start
-- Existing-node search with graph focus
-- Wheel/trackpad zoom and drag panning
-- Deterministic name dedupe for simple variants
-- Node size based on weighted observation prominence
-- Public search mode with bulk expansion controls hidden by default
+## Run
 
-## Requirements
-
-- Node.js 18 or newer
-- A DeepSeek API key for live generation
-
-## Quick Start
+Use **Node.js 24.x** (tested with 24.15.0). There are no runtime dependencies or build step; the server serves the browser files directly.
 
 ```powershell
 npm start
 ```
 
-Open http://localhost:3000.
+The server binds to `127.0.0.1:3000` by default. Open the private write-access URL printed in its terminal to enable generation in that browser. Without a configured token, the server creates a new private token for each process; use its new link after restarting.
 
-Without a configured provider API key, the app runs in mock mode so the interface is usable immediately.
+To keep a stable token, set `INFLUENCE_MAP_ADMIN_TOKEN` in your shell or `.env.local`, then open `http://127.0.0.1:3000/?admin=YOUR_TOKEN` once. The browser stores the token locally and removes it from the address bar. It sends the token in `x-admin-token`; API keys stay on the server. Environment files use Node's native dotenv parser, including quotes and comments. Existing shell variables take precedence; `.env` loads first and `.env.local` fills missing values.
 
-## DeepSeek Setup
+Anonymous visitors can browse and focus existing entities. All graph mutations and model calls require private write access. `HOST` and `PORT` configure the listening address and port; choose network access deliberately if changing `HOST`.
 
-Set these environment variables before starting the server:
+## Mock and live generation
+
+With no provider key, the selected provider falls back to **mock mode**. `INFLUENCE_MAP_LLM_PROVIDER=mock` selects it explicitly, even when live keys exist. Mock mode never contacts a provider. It provides demo neighborhoods for DayZ, Joy Division and David Bowie; unknown entities return no demo links and are marked sampled. Demo samples are labeled separately from live model samples.
+
+For DeepSeek:
 
 ```powershell
+$env:INFLUENCE_MAP_LLM_PROVIDER="deepseek"
 $env:DEEPSEEK_API_KEY="your_key_here"
 $env:DEEPSEEK_MODEL="deepseek-v4-flash"
 $env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
 $env:DEEPSEEK_THINKING="disabled"
-$env:PORT="3000"
 npm start
 ```
 
-The browser never receives the API key. It calls the local server at `/api/influences`, and the server calls DeepSeek.
-For this graph-building workflow, `DEEPSEEK_THINKING` defaults to `disabled` so the small JSON identity and expansion calls stay fast and cheap. Set it to `enabled` only when you intentionally want slower reasoning-mode calls.
-
-## OpenRouter / Gemini Setup
-
-OpenRouter can be used as the server-side provider for Google's Gemini Flash Lite model:
+For OpenRouter:
 
 ```powershell
 $env:INFLUENCE_MAP_LLM_PROVIDER="openrouter"
-$env:OPENROUTER_API_KEY="your_openrouter_key_here"
+$env:OPENROUTER_API_KEY="your_key_here"
 $env:OPENROUTER_MODEL="google/gemini-3.1-flash-lite-preview"
 $env:OPENROUTER_BASE_URL="https://openrouter.ai/api/v1"
 $env:OPENROUTER_REASONING="none"
 $env:OPENROUTER_JSON_MODE="1"
-$env:INFLUENCE_MAP_LLM_CONCURRENCY="1"
-$env:INFLUENCE_MAP_LLM_TIMEOUT_MS="45000"
-$env:PORT="3000"
 npm start
 ```
 
-The browser still does not receive the API key. `OPENROUTER_REASONING=none` keeps Gemini's thinking mode off for this low-latency JSON workflow. `OPENROUTER_JSON_MODE=1` uses OpenRouter JSON mode, which is faster for this app than strict schema mode while still being parsed and sanitized by the server. Set it to `0` if you want stricter schema enforcement and can accept higher latency.
-By default, the server sends no `max_tokens` cap. Set `INFLUENCE_MAP_LLM_MAX_TOKENS` only if you want to force one. `INFLUENCE_MAP_LLM_CONCURRENCY=1` avoids provider-side queue spikes when several expansions are clicked at once.
+These are the app's existing model defaults, not a guarantee of provider availability. Configure a model available on your account. JSON mode is sanitized server-side; `OPENROUTER_JSON_MODE=0` requests a strict response schema instead.
 
-## Persistence
+Generation may involve an identity call, an influence call and a scoped identity-review call. A successfully generated neighborhood is committed before ancillary identity review, so that review failing cannot discard the samples.
 
-The graph is saved automatically by the local server and restored when the app starts. By default, SQLite data is written to `./data/influence-map.sqlite`, which is ignored by git. If an older `./data/graph.json` exists and the SQLite database is empty, the server migrates it on first start.
+## Limits and billing controls
 
-To store it somewhere else:
+The defaults are:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `INFLUENCE_MAP_MUTATIONS_PER_MINUTE` | 30 | Authenticated mutations per client address |
+| `INFLUENCE_MAP_LLM_CONCURRENCY` | 1 | Active provider calls |
+| `INFLUENCE_MAP_LLM_MAX_QUEUE` | 8 | Maximum waiting provider calls |
+| `INFLUENCE_MAP_LLM_TIMEOUT_MS` | 45000 | Provider timeout and maximum queue wait |
+| `INFLUENCE_MAP_LLM_MAX_TOKENS` | 2048 | Output cap per call, constrained to 128–8192 |
+| `INFLUENCE_MAP_LLM_DAILY_REQUESTS` | 100 | Daily provider-call cap |
+| `INFLUENCE_MAP_LLM_DAILY_TOKENS` | 100000 | Daily reserved input/output token cap |
+
+Daily reservations persist in SQLite and use UTC days. Input reservations conservatively use UTF-8 prompt bytes plus message overhead; prompts above the 20,000-byte reservation limit are rejected. Reservations are retained after failures or cancellation because a provider may still bill the call. Queue capacity, deadlines and disconnect cancellation prevent unlimited waiting requests. One expansion may consume several provider-call reservations.
+
+An optional currency budget uses `INFLUENCE_MAP_LLM_DAILY_USD`, `INFLUENCE_MAP_LLM_INPUT_USD_PER_MILLION` and `INFLUENCE_MAP_LLM_OUTPUT_USD_PER_MILLION`. A positive currency budget requires positive input/output prices. Supply conservative prices for the configured model, including applicable reasoning-token billing. This is a reservation estimate based on your configured rates; provider invoices remain authoritative. Currency limiting is off by default, while request and token caps are always enforced.
+
+## Graph persistence and identity
+
+The server commits observations incrementally. Each entity has a permanent `uid`; its legacy normalized `id` is a name lookup key and can change on rename. Redundant UIDs retired by a merge retain durable redirects to the surviving identity. Observation IDs remain stable. References include `fromUid` and `toUid`. Expansion request IDs make retries idempotent.
+
+Browsers receive revisioned changes and cannot replace the graph. Stale destructive edits receive HTTP 409 and require a refresh. Pan, zoom (0.04–8), score filters and node layouts are stored only in that browser. Interacting with a view cannot erase another visitor's graph additions.
+
+The score filter applies **after** each directed edge is averaged across its complete sample history. Filtering never removes samples from that mean or from upstream analysis. Zero is a valid score.
+
+SQLite defaults to `data/influence-map.sqlite`. Use `INFLUENCE_MAP_DB_FILE` to change it. An existing `data/graph.json` is imported once into a new empty database, preserving available sample metadata; `INFLUENCE_MAP_DATA_FILE` changes that legacy input. A persistent migration marker prevents reset graphs from importing the old file again.
+
+A verified SQLite backup is made in the database's `backups/` directory before startup schema changes. Keep the initial source/data backup when upgrading this prototype. Backups are retained until you remove them deliberately.
+
+## Identity review and undo
+
+Set `INFLUENCE_MAP_DEV_TOOLS=1`, then open the app with private access to enable Identity, Diagnostics, maintenance and batch-expansion controls.
+
+Automatic identity application is **off by default**. `INFLUENCE_MAP_IDENTITY_AUTO_APPROVE=1` enables gated application of model decisions. Local spelling/title heuristics remain review candidates. Review entity senses carefully: shared names, franchises, adaptations and individual works can refer to different things.
+
+Manual approval implements merges, renames and splits. A split lists the source node's current samples and requires exact sample IDs to move. Scoped model split suggestions remain pending until this information is reviewed. Renames retain the entity UID and sample IDs; the historical expansion source wording remains unchanged.
+
+Identity edits, reset and orphan cleanup retain an audit record and an undo snapshot. Open **Identity → Edit history and undo**. Only the latest edit can be undone while its resulting graph revision is still current; newer samples are protected from being overwritten. Samples that collapse into self-relations during a merge remain recoverable in that edit's snapshot. Restore an older verified database backup separately when a later snapshot cannot safely be undone. Stop the app before replacing a database.
+
+The known legacy Rust game/language mix-up has a bounded repair command:
 
 ```powershell
-$env:INFLUENCE_MAP_DATA_FILE="C:\tmp\influence-map.json"
-$env:INFLUENCE_MAP_DB_FILE="C:\tmp\influence-map.sqlite"
-npm start
+node scripts/correct-rust-identity.js --db "C:\path\influence-map.sqlite" --legacy "C:\path\graph.json" --apply
 ```
 
-The server also normalizes the saved graph on startup so older duplicate node variants are folded through the current deterministic dedupe rules.
+Stop the app first. The command verifies a backup, matches the three specific original DayZ → bare Rust samples, and moves only those samples to `Rust (video game)`. It preserves IDs, scores, timestamps and unknown provenance; it does not verify the influence claim itself. Official identity references are [Facepunch's game page](https://facepunch.com/games/rust) and the [Rust language website](https://rust-lang.org/). The correction is audited, can be undone before later graph changes, and will not silently reapply after an undo.
 
-## Dev Tools
+## Navigation and diagnostics
 
-Bulk frontier expansion and reset controls are hidden from normal visitors. To enable them for local curation:
+Search focuses a unique existing entity. Ambiguous matches show explicit choices. With private access, a missing entity can generate a neighborhood. Table view supports filtering, sorting and graph focus. Drag to pan or reposition nodes, scroll to zoom, and use Fit or Center to navigate.
+
+Next-expansion and upstream analysis run in a Web Worker. Connectivity partitions are calculated in one traversal, independent of the drawing layout. The main thread keeps rendering and accepting input while analysis runs. Development diagnostics retain recent model call timing and usage; they do not constitute a full billing ledger.
+
+## API changes
+
+- `GET /api/graph` returns a snapshot; `GET /api/graph?since=REVISION` returns ordered deltas, with a snapshot fallback for an unavailable revision.
+- `POST /api/influences` accepts `entity`, `revision` and a unique `requestId`; the server persists before replying.
+- Whole-graph `PUT /api/graph` is removed (405 for authenticated clients).
+- `POST /api/reset`, identity approval and undo require the current `revision`.
+- `GET /api/history` and `POST /api/history/ID/undo` require authenticated development access.
+- Mutations require `x-admin-token`. Cross-origin mutations are rejected. Static responses use a restrictive script policy, and untrusted UI text is escaped.
+
+## Project layout
+
+| Path | Responsibility |
+| --- | --- |
+| `server.js` | HTTP routes, generation workflow and identity review |
+| `lib/config.js` | Environment loading and server/provider limits |
+| `lib/llm-client.js` | Provider protocol, bounded queue and budget reservations |
+| `lib/graph-store.js` and `lib/schema.js` | SQLite persistence, revisions, migrations and undo |
+| `lib/identity.js` | Pure name comparisons and identity candidate discovery |
+| `public/graph-model.js` | Shared name keys and complete-history edge/statistics aggregation |
+| `public/app.js` | Browser interaction, view state and canvas rendering |
+| `public/analysis-worker.js` and `public/graph-analysis.js` | Background rankings and upstream traversal |
+| `test/` | Isolated storage, HTTP, configuration, browser-model and worker regression checks |
+
+The server, browser and worker share the graph model without a bundler. Browser statistics are cached until the graph changes; score filters partition the existing edges. SQLite statements are reused per store connection. Runtime data, secrets and server logs stay outside version control.
+
+## Validation
 
 ```powershell
-$env:INFLUENCE_MAP_DEV_TOOLS="1"
-$env:INFLUENCE_MAP_ADMIN_TOKEN="choose-a-private-token"
-npm start
+npm test
 ```
 
-When `INFLUENCE_MAP_ADMIN_TOKEN` is set, open the app once with `?admin=choose-a-private-token` to unlock dev tools in that browser. The token is stored in local storage and sent as `x-admin-token` for admin-only endpoints.
+The suite uses isolated databases, child servers, a loopback provider stub, browser-model tests and the actual analysis worker. It makes **no paid provider calls**. It covers persistence/restart, stable IDs, idempotency, revision conflicts, merge/split/rename and undo, authorization, malformed requests, queue/rate/budget bounds, HTML escaping, aggregation, zero scores, view storage and rendering invalidation.
 
-The UI uses whichever server-side provider is configured. Searching for a missing entity requires live generation; if the selected provider has no API key configured, the server returns an error instead of adding generic placeholder relationships.
-
-Dev mode includes an LLM-assisted dedupe review. The server first builds cheap local duplicate candidates, then sends only those candidates to the configured provider for a JSON review. It reports suggested groups but does not merge automatically.
-
-Dev mode also includes a Diagnostics tab. It shows the active provider/model, queue state, database counts, recent successful and failed model calls, token usage, and request timings. Diagnostics are persisted in SQLite in `llm_profiles`, so restarts do not erase the trail. The benchmark button runs a tiny provider check without changing the graph.
-
-For Codex browser automation, this machine can use the bundled Node runtime by setting `NODE_REPL_NODE_PATH` to:
-
-```text
-C:\Users\edwar\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe
-```
-
-Restart the Codex desktop app after setting it so the browser automation plugin can pick it up.
-
-## Data Shape
-
-Each model response is expected to be strict JSON:
-
-```json
-{
-  "entity": "Joy Division",
-  "influencedBy": [
-    { "entity": "David Bowie", "confidence": 0.82 }
-  ],
-  "influenced": [
-    { "entity": "Interpol", "confidence": 0.88 }
-  ]
-}
-```
-
-The app converts that into directed observations:
-
-```txt
-David Bowie -> Joy Division
-Joy Division -> Interpol
-```
-
-Repeated observations for the same directed edge are averaged into one visible graph edge. Observations store confidence, source expansion entity, provider/model, and timestamp so selected edges can show their underlying history.
-
-Entity names are deduped with a cheap deterministic key: case, punctuation, whitespace, leading `the`, and `&`/`and` variants are normalized before nodes and edges are merged. Popularity is the unbounded weighted number of observations connected to that entity, so prominence emerges from repeated graph evidence rather than another LLM field. Circle size is a relative visual scale based on the current graph's most prominent entity, while the raw popularity score keeps growing.
-
-## Notes
-
-This prototype treats the LLM as an estimate generator, not a citation engine. The confidence values are useful for exploration and ranking, but they are not verified historical evidence.
+Browser smoke checks should also cover Graph/Table visibility, ambiguous search, score filters, zoom, upstream highlighting, identity history and a mock expansion at the saved dataset size. For the ranking performance gate, run three cold Next-panel loads and inspect `#next-output`'s `data-analysis-submit-ms` and `data-analysis-max-task-ms`. A supported Long Tasks observer must show no ranking-related task above 100 ms; `0.00` means no observed task reached the observer's 50 ms reporting threshold. These measurements do not establish the factual accuracy of the generated graph.

@@ -1,9 +1,12 @@
+const { normalizeName: displayName, keyFor, edgeKey, aggregateGraph } = GraphModel;
 const canvas = document.querySelector("#graph-canvas");
 const ctx = canvas.getContext("2d");
 let activityTicker = 0;
 
 const state = {
   nodes: new Map(),
+  revision: 0,
+  canWrite: false,
   observations: [],
   edges: new Map(),
   hiddenEdges: new Map(),
@@ -21,9 +24,8 @@ const state = {
   loaded: false,
   searching: false,
   saveTimer: null,
-  saveVersion: 0,
-  maxWeightedPopularity: 0
-  ,
+  maxProminence: 1,
+  graphCache: { edges: new Map(), stats: new Map() },
   view: "graph",
   tableSort: "popularity",
   tableDirection: "desc",
@@ -39,7 +41,11 @@ const state = {
   panelTab: "selected",
   activities: [],
   activityCounter: 0,
-  physicsFrame: 0
+  physicsFrame: 0,
+  lastRenderAt: 0,
+  renderDirty: true,
+  interactingUntil: 0,
+  interactionWasActive: false
 };
 
 const els = {
@@ -101,12 +107,8 @@ function adminHeaders() {
   return token ? { "x-admin-token": token } : {};
 }
 
-function displayName(name) {
-  return String(name || "").trim().replace(/\s+/g, " ");
-}
-
 function escapeHtml(value) {
-  return String(value || "")
+  return String(value ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -114,22 +116,13 @@ function escapeHtml(value) {
     .replace(/'/g, "&#039;");
 }
 
-function canonicalName(name) {
-  return displayName(name)
-    .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/[()[\]{}'"`.,:;!?]/g, " ")
-    .replace(/\s+/g, " ")
-    .replace(/^the\s+/, "")
-    .trim();
+function markRenderDirty() {
+  state.renderDirty = true;
 }
 
-function keyFor(name) {
-  return canonicalName(name);
-}
-
-function edgeKey(from, to) {
-  return `${keyFor(from)}=>${keyFor(to)}`;
+function markInteracting(duration = 180) {
+  state.interactingUntil = performance.now() + duration;
+  markRenderDirty();
 }
 
 function invalidateGraphAnalysis() {
@@ -165,151 +158,60 @@ function ensureNode(name) {
   return state.nodes.get(id);
 }
 
-function renameNode(nodeOrName, nextName) {
-  const canonical = displayName(nextName);
-  const previousId = typeof nodeOrName === "string" ? keyFor(nodeOrName) : nodeOrName && nodeOrName.id;
-  const nextId = keyFor(canonical);
-  if (!previousId || !nextId || !canonical || !state.nodes.has(previousId)) {
-    return state.nodes.get(previousId) || ensureNode(canonical);
-  }
-
-  invalidateGraphAnalysis();
-  const previous = state.nodes.get(previousId);
-  if (previousId !== nextId && state.expanded.has(previousId)) {
-    const canonicalNode = ensureNode(canonical);
-    if (canonicalNode && !canonicalNode.aliases.includes(previous.name)) {
-      canonicalNode.aliases.push(previous.name);
-    }
-    return canonicalNode;
-  }
-  const target = state.nodes.get(nextId);
-  const aliases = new Set([
-    previous.name,
-    canonical,
-    ...(previous.aliases || []),
-    ...(target && target.aliases ? target.aliases : [])
-  ].map(displayName).filter(Boolean));
-
-  if (target && target !== previous) {
-    target.name = canonical;
-    target.aliases = [...aliases].filter(alias => alias !== canonical).slice(0, 20);
-    target.popularity = Math.max(target.popularity || 0, previous.popularity || 0);
-    target.weightedPopularity = Math.max(target.weightedPopularity || 0, previous.weightedPopularity || 0);
-    target.x = Number.isFinite(target.x) ? target.x : previous.x;
-    target.y = Number.isFinite(target.y) ? target.y : previous.y;
-    state.nodes.delete(previousId);
-  } else {
-    previous.name = canonical;
-    previous.aliases = [...aliases].filter(alias => alias !== canonical).slice(0, 20);
-    if (previousId !== nextId) {
-      previous.id = nextId;
-      state.nodes.delete(previousId);
-      state.nodes.set(nextId, previous);
-    }
-  }
-
-  for (const observation of state.observations) {
-    if (keyFor(observation.from) === previousId || keyFor(observation.from) === nextId) observation.from = canonical;
-    if (keyFor(observation.to) === previousId || keyFor(observation.to) === nextId) observation.to = canonical;
-    if (keyFor(observation.sourceEntity) === previousId || keyFor(observation.sourceEntity) === nextId) observation.sourceEntity = canonical;
-  }
-  if (state.expanded.has(previousId)) {
-    state.expanded.delete(previousId);
-    state.expanded.add(nextId);
-  }
-  if (state.selected && state.selected.type === "node" && state.selected.id === previousId) {
-    state.selected.id = nextId;
-  }
-  return state.nodes.get(nextId);
-}
-
-function addObservation(from, to, confidence, meta = {}) {
-  const source = ensureNode(from);
-  const target = ensureNode(to);
-  if (!source || !target || source.id === target.id) return;
-  state.observations.push({
-    from: source.name,
-    to: target.name,
-    confidence: Math.max(0, Math.min(1, Number(confidence) || 0.5)),
-    sourceEntity: displayName(meta.sourceEntity || ""),
-    provider: displayName(meta.provider || ""),
-    model: displayName(meta.model || ""),
-    createdAt: meta.createdAt || new Date().toISOString()
-  });
-  invalidateGraphAnalysis();
-  recomputeEdges();
-}
-
 function recomputeEdges() {
-  const visibleGrouped = new Map();
-  const hiddenGrouped = new Map();
-  state.maxWeightedPopularity = 0;
-  for (const node of state.nodes.values()) {
-    node.popularity = 0;
-    node.weightedPopularity = 0;
+  let cache = state.graphCache;
+  if (!cache || cache.version !== state.graphAnalysisVersion || cache.nodeCount !== state.nodes.size) {
+    const result = aggregateGraph(state.nodes, state.observations);
+    cache = state.graphCache = { version: state.graphAnalysisVersion, nodeCount: state.nodes.size, ...result };
+    state.maxProminence = 1;
+    for (const { node, observations, confidenceSum, neighbors } of cache.stats.values()) {
+      node.popularity = observations;
+      node.weightedPopularity = confidenceSum;
+      node.prominence = confidenceSum + neighbors.size * 0.7 + Math.log2(1 + observations) * 1.4;
+      state.maxProminence = Math.max(state.maxProminence, node.prominence);
+    }
+    cacheNodeRadii();
   }
-
-  for (const obs of state.observations) {
-    const source = ensureNode(obs.from);
-    const target = ensureNode(obs.to);
-    if (!source || !target) continue;
-    source.popularity += 1;
-    target.popularity += 1;
-    source.weightedPopularity += obs.confidence;
-    target.weightedPopularity += obs.confidence;
-    state.maxWeightedPopularity = Math.max(
-      state.maxWeightedPopularity,
-      source.weightedPopularity,
-      target.weightedPopularity
-    );
+  if (cache.minConfidence !== state.minConfidence) {
+    state.edges = new Map();
+    state.hiddenEdges = new Map();
+    for (const [key, edge] of cache.edges) {
+      (edge.confidence >= state.minConfidence ? state.edges : state.hiddenEdges).set(key, edge);
+    }
+    cache.minConfidence = state.minConfidence;
   }
+}
 
-  for (const obs of state.observations) {
-    const grouped = obs.confidence < state.minConfidence ? hiddenGrouped : visibleGrouped;
-    const key = edgeKey(obs.from, obs.to);
-    const current = grouped.get(key) || {
-      from: ensureNode(obs.from),
-      to: ensureNode(obs.to),
-      sum: 0,
-      count: 0,
-      observations: []
-    };
-    current.sum += obs.confidence;
-    current.count += 1;
-    current.observations.push(obs);
-    grouped.set(key, current);
-  }
+function nodeProminence(node) {
+  return Math.max(0, node.prominence || node.weightedPopularity || 0);
+}
 
-  function toEdges(grouped) {
-    return new Map(
-      [...grouped].map(([key, edge]) => [
-        key,
-        {
-          from: edge.from,
-          to: edge.to,
-          confidence: edge.sum / edge.count,
-          count: edge.count,
-          observations: edge.observations
-        }
-      ])
-    );
-  }
-
-  state.edges = toEdges(visibleGrouped);
-  state.hiddenEdges = toEdges(hiddenGrouped);
+function maxNodeProminence() {
+  return Math.max(1, state.maxProminence || 0);
 }
 
 function nodeRadius(node) {
-  const baseRadius = 14;
-  const visualRange = 28;
-  const maxPopularity = Math.max(1, state.maxWeightedPopularity || 0);
-  const share = Math.max(0, node.weightedPopularity || 0) / maxPopularity;
-  return baseRadius + Math.sqrt(share) * visualRange;
+  if (Number.isFinite(node.visualRadius)) return node.visualRadius;
+  const baseRadius = 10;
+  const visualRange = 30;
+  const score = nodeProminence(node);
+  const maxScore = maxNodeProminence();
+  const share = Math.log1p(score) / Math.log1p(maxScore);
+  return baseRadius + Math.max(0, share) * visualRange;
 }
 
-function popularityPercent(node) {
-  const maxPopularity = Math.max(1, state.maxWeightedPopularity || 0);
-  return Math.round((Math.max(0, node.weightedPopularity || 0) / maxPopularity) * 100);
+function cacheNodeRadii() {
+  const baseRadius = 10;
+  const visualRange = 30;
+  const maxScore = maxNodeProminence();
+  for (const node of state.nodes.values()) {
+    const share = Math.log1p(nodeProminence(node)) / Math.log1p(maxScore);
+    node.visualRadius = baseRadius + Math.max(0, share) * visualRange;
+  }
+}
+
+function prominencePercent(node) {
+  return Math.round((nodeProminence(node) / maxNodeProminence()) * 100);
 }
 
 function clampZoom(zoom) {
@@ -331,6 +233,7 @@ function focusNode(node, targetZoom) {
   setStatus(`Focused ${node.name}.`);
   scheduleSave();
   updateUi();
+  markRenderDirty();
   return true;
 }
 
@@ -339,6 +242,7 @@ function clearSelection() {
   state.hovered = null;
   setStatus("Selection cleared.");
   updateUi();
+  markRenderDirty();
 }
 
 function selectedNodeId() {
@@ -401,21 +305,56 @@ function fitGraph() {
   updateUi();
 }
 
+function isNodeInViewport(node, margin = 120) {
+  const rect = canvas.getBoundingClientRect();
+  const left = (0 - state.pan.x) / state.zoom - margin;
+  const right = (rect.width - state.pan.x) / state.zoom + margin;
+  const top = (0 - state.pan.y) / state.zoom - margin;
+  const bottom = (rect.height - state.pan.y) / state.zoom + margin;
+  return node.x >= left && node.x <= right && node.y >= top && node.y <= bottom;
+}
+
+function visibleNodeCount() {
+  let count = 0;
+  for (const node of state.nodes.values()) {
+    if (isNodeInViewport(node)) count += 1;
+  }
+  return count;
+}
+
+function viewportBounds(margin = 140) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    left: (0 - state.pan.x) / state.zoom - margin,
+    right: (rect.width - state.pan.x) / state.zoom + margin,
+    top: (0 - state.pan.y) / state.zoom - margin,
+    bottom: (rect.height - state.pan.y) / state.zoom + margin
+  };
+}
+
+function pointInBounds(node, bounds) {
+  return node.x >= bounds.left && node.x <= bounds.right && node.y >= bounds.top && node.y <= bounds.bottom;
+}
+
+function edgeInBounds(edge, bounds) {
+  const minX = Math.min(edge.from.x, edge.to.x);
+  const maxX = Math.max(edge.from.x, edge.to.x);
+  const minY = Math.min(edge.from.y, edge.to.y);
+  const maxY = Math.max(edge.from.y, edge.to.y);
+  return maxX >= bounds.left && minX <= bounds.right && maxY >= bounds.top && minY <= bounds.bottom;
+}
+
+function findNodesByQuery(query) {
+  const needle = keyFor(query);
+  if (!needle) return [];
+  if (state.nodes.has(needle)) return [state.nodes.get(needle)];
+  return [...state.nodes.values()].filter(node => [node.name, ...(node.aliases || [])].some(name => keyFor(name).includes(needle)))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 function findNodeByQuery(query) {
-  const needle = canonicalName(query);
-  if (!needle) return null;
-  if (state.nodes.has(needle)) return state.nodes.get(needle);
-
-  const candidates = [...state.nodes.values()].filter(node => {
-    const names = [node.name, ...(node.aliases || [])].map(canonicalName);
-    return names.some(name => name.includes(needle) || needle.includes(name));
-  });
-
-  return candidates.sort((a, b) => {
-    const scoreA = Math.abs(canonicalName(a.name).length - needle.length);
-    const scoreB = Math.abs(canonicalName(b.name).length - needle.length);
-    return scoreA - scoreB || b.weightedPopularity - a.weightedPopularity;
-  })[0] || null;
+  const matches = findNodesByQuery(query);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function setView(view) {
@@ -430,6 +369,8 @@ function setView(view) {
 
 function setPanelTab(tab) {
   state.panelTab = tab;
+  state.rootTrace = null;
+  markRenderDirty();
   els.panelTabs.forEach(button => {
     const active = button.getAttribute("data-panel-tab") === tab;
     button.setAttribute("aria-pressed", String(active));
@@ -440,368 +381,110 @@ function setPanelTab(tab) {
 }
 
 function entityStats() {
-  const stats = new Map([...state.nodes.values()].map(node => [node.id, {
-    id: node.id,
-    name: node.name,
-    aliases: node.aliases || [],
-    incoming: 0,
-    outgoing: 0,
-    connections: new Set(),
-    observations: 0,
-    popularity: node.weightedPopularity || 0,
+  return [...state.graphCache.stats.values()].map(({ node, incoming, outgoing, observations, neighbors }) => ({
+    id: node.id, name: node.name, aliases: node.aliases || [], incoming, outgoing,
+    observations, connectionCount: neighbors.size, popularity: nodeProminence(node),
     expanded: state.expanded.has(node.id)
-  }]));
-
-  for (const obs of state.observations) {
-    const from = keyFor(obs.from);
-    const to = keyFor(obs.to);
-    if (stats.has(from)) {
-      const item = stats.get(from);
-      item.outgoing += 1;
-      item.observations += 1;
-      item.connections.add(to);
-    }
-    if (stats.has(to)) {
-      const item = stats.get(to);
-      item.incoming += 1;
-      item.observations += 1;
-      item.connections.add(from);
-    }
-  }
-
-  return [...stats.values()].map(item => ({
-    ...item,
-    connectionCount: item.connections.size
   }));
 }
 
-function allGraphEdges() {
-  const merged = new Map(state.hiddenEdges);
-  for (const [key, edge] of state.edges) merged.set(key, edge);
-  return [...merged].map(([key, edge]) => ({ key, ...edge }));
+let analysisWorker = null;
+let workerVersion = -1;
+let analysisCounter = 0;
+const analysisRequests = new Map();
+const analysisLongTasks = [];
+let analysisObserver = null;
+if (typeof PerformanceObserver !== "undefined" && PerformanceObserver.supportedEntryTypes?.includes("longtask")) {
+  analysisObserver = new PerformanceObserver(list => {
+    analysisLongTasks.push(...list.getEntries());
+    if (analysisLongTasks.length > 100) analysisLongTasks.splice(0, analysisLongTasks.length - 100);
+  });
+  analysisObserver.observe({ type: "longtask" });
 }
 
-function buildIncomingIndex() {
-  const incoming = new Map();
-  for (const edge of allGraphEdges()) {
-    const bucket = incoming.get(edge.to.id) || [];
-    bucket.push(edge);
-    incoming.set(edge.to.id, bucket);
-  }
-  for (const bucket of incoming.values()) {
-    bucket.sort((a, b) => (b.confidence * Math.log2(b.count + 1)) - (a.confidence * Math.log2(a.count + 1)));
-  }
-  return incoming;
-}
-
-function buildOutgoingIndex() {
-  const outgoing = new Map();
-  for (const edge of allGraphEdges()) {
-    const bucket = outgoing.get(edge.from.id) || [];
-    bucket.push(edge);
-    outgoing.set(edge.from.id, bucket);
-  }
-  return outgoing;
-}
-
-function traceRoots(targetId, options = {}, indexes = {}) {
-  const target = state.nodes.get(targetId);
-  if (!target) return null;
-  const maxDepth = Math.max(2, Math.min(10, Number(options.depth || 7)));
-  const branchLimit = Math.max(2, Math.min(8, Number(options.branchLimit || 5)));
-  const incoming = indexes.incoming || buildIncomingIndex();
-  const roots = new Map();
-  const paths = [];
-  const traceNodeIds = new Set([target.id]);
-  const traceEdgeKeys = new Set();
-
-  function addRoot(node, path, score, depth, terminalReason) {
-    const existing = roots.get(node.id) || {
-      node,
-      score: 0,
-      paths: 0,
-      bestScore: 0,
-      maxDepth: 0,
-      terminalReason
-    };
-    existing.score += score;
-    existing.paths += 1;
-    existing.bestScore = Math.max(existing.bestScore, score);
-    existing.maxDepth = Math.max(existing.maxDepth, depth);
-    roots.set(node.id, existing);
-    paths.push({ root: node, path: [...path], score, depth, terminalReason });
-    for (const step of path) {
-      traceNodeIds.add(step.from.id);
-      traceNodeIds.add(step.to.id);
-      traceEdgeKeys.add(step.key);
-    }
-  }
-
-  function walk(node, path, score, visited) {
-    const depth = path.length;
-    const incomingEdges = (incoming.get(node.id) || [])
-      .filter(edge => !visited.has(edge.from.id))
-      .slice(0, branchLimit);
-    if (!incomingEdges.length || depth >= maxDepth) {
-      addRoot(node, path, score * (1 + depth * 0.12), depth, incomingEdges.length ? "depth limit" : "no known upstream influences");
-      return;
-    }
-    for (const edge of incomingEdges) {
-      const nextScore = score * Math.max(0.08, edge.confidence) * (1 + Math.log2(edge.count + 1) * 0.08);
-      walk(edge.from, [edge, ...path], nextScore, new Set([...visited, edge.from.id]));
-    }
-  }
-
-  walk(target, [], 1, new Set([target.id]));
+function analysisSnapshot() {
   return {
-    target,
-    nodeIds: traceNodeIds,
-    edgeKeys: traceEdgeKeys,
-    roots: [...roots.values()]
-      .filter(item => item.node.id !== target.id)
-      .sort((a, b) => b.score - a.score || b.maxDepth - a.maxDepth)
-      .slice(0, 12),
-    paths: paths
-      .filter(item => item.root.id !== target.id && item.path.length)
-      .sort((a, b) => b.score - a.score || b.depth - a.depth)
-      .slice(0, 8)
+    nodes: [...state.nodes.values()].map(({ id, name }) => ({ id, name })),
+    observations: state.observations.map(({ from, to, confidence, sourceEntity }) => ({ from, to, confidence, sourceEntity })),
+    expanded: [...state.expanded], expanding: [...state.expanding]
   };
 }
 
-function cachedTraceRoots(targetId, options = {}, indexes = {}) {
-  const depth = Math.max(2, Math.min(10, Number(options.depth || 7)));
-  const branchLimit = Math.max(2, Math.min(8, Number(options.branchLimit || 5)));
-  const key = `${state.graphAnalysisVersion}:${targetId}:${depth}:${branchLimit}`;
-  if (state.rootTraceCache.has(key)) return state.rootTraceCache.get(key);
-  const trace = traceRoots(targetId, { depth, branchLimit }, indexes);
-  state.rootTraceCache.set(key, trace);
-  if (state.rootTraceCache.size > 400) {
-    const first = state.rootTraceCache.keys().next().value;
-    state.rootTraceCache.delete(first);
-  }
-  return trace;
-}
-
-function globalInfluenceMetrics(limit = 12) {
-  const requestedLimit = Math.max(1, Number(limit) || 12);
-  if (
-    state.rootMetricsCache
-    && state.rootMetricsCache.version === state.graphAnalysisVersion
-    && state.rootMetricsCache.limit >= requestedLimit
-  ) {
-    return state.rootMetricsCache.scores.slice(0, requestedLimit);
-  }
-
-  const edges = allGraphEdges();
-  const outgoing = new Map();
-  const incoming = new Map();
-  for (const edge of edges) {
-    const outBucket = outgoing.get(edge.from.id) || [];
-    outBucket.push(edge);
-    outgoing.set(edge.from.id, outBucket);
-    const inBucket = incoming.get(edge.to.id) || [];
-    inBucket.push(edge);
-    incoming.set(edge.to.id, inBucket);
-  }
-  for (const bucket of incoming.values()) {
-    bucket.sort((a, b) => (b.confidence * Math.log2(b.count + 1)) - (a.confidence * Math.log2(a.count + 1)));
-  }
-  const bridgeCounts = new Map();
-  const rootCounts = new Map();
-
-  for (const node of state.nodes.values()) {
-    const trace = cachedTraceRoots(node.id, { depth: 5, branchLimit: 3 }, { incoming });
-    if (!trace) continue;
-    for (const root of trace.roots.slice(0, 8)) {
-      rootCounts.set(root.node.id, (rootCounts.get(root.node.id) || 0) + root.score);
-    }
-    for (const path of trace.paths.slice(0, 6)) {
-      const inner = path.path.slice(1, -1);
-      for (const edge of inner) {
-        bridgeCounts.set(edge.to.id, (bridgeCounts.get(edge.to.id) || 0) + path.score);
+async function requestAnalysis(kind, targetId = null) {
+  const started = performance.now();
+  const version = state.graphAnalysisVersion;
+  const key = kind + ":" + version + ":" + (targetId || "");
+  if (analysisRequests.has(key)) return analysisRequests.get(key);
+  if (!analysisWorker) analysisWorker = new Worker("/analysis-worker.js");
+  const id = ++analysisCounter;
+  const promise = new Promise((resolve, reject) => {
+    const receive = ({ data }) => {
+      if (data.id !== id) return;
+      cleanup();
+      if (data.error) reject(new Error(data.error));
+      else {
+        resolve(data);
+        requestAnimationFrame(() => window.setTimeout(() => {
+          const panel = kind === "next" ? els.nextOutput : els.rootsOutput;
+          const supported = typeof PerformanceObserver !== "undefined" && PerformanceObserver.supportedEntryTypes?.includes("longtask");
+          analysisLongTasks.push(...(analysisObserver?.takeRecords() || []));
+          const maximum = Math.max(0, ...analysisLongTasks.filter(entry => entry.startTime + entry.duration >= started).map(entry => entry.duration));
+          panel.dataset.analysisMaxTaskMs = supported ? maximum.toFixed(2) : "unsupported";
+        }, 0));
       }
-    }
-  }
-
-  const scores = [];
-  for (const node of state.nodes.values()) {
-    const seen = new Set([node.id]);
-    let frontier = [{ node, depth: 0, score: 1 }];
-    let downstream = 0;
-    let confidenceFlow = 0;
-    const firstBranches = new Set();
-    for (let depth = 0; depth < 6; depth += 1) {
-      const next = [];
-      for (const item of frontier) {
-        for (const edge of outgoing.get(item.node.id) || []) {
-          if (seen.has(edge.to.id)) continue;
-          seen.add(edge.to.id);
-          if (depth === 0) firstBranches.add(edge.to.id);
-          const edgeScore = item.score * Math.max(0.1, edge.confidence) * (1 + Math.log2(edge.count + 1) * 0.08);
-          downstream += 1 / (depth + 1);
-          confidenceFlow += edgeScore;
-          next.push({ node: edge.to, depth: depth + 1, score: edgeScore });
-        }
-      }
-      frontier = next
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 90);
-      if (!frontier.length) break;
-    }
-    const upstreamCount = (incoming.get(node.id) || []).length;
-    const directOut = (outgoing.get(node.id) || []).length;
-    const reachScore = downstream + confidenceFlow;
-    const rootScore = (rootCounts.get(node.id) || 0) * (1 / Math.sqrt(1 + upstreamCount));
-    const bridgeScore = bridgeCounts.get(node.id) || 0;
-    const diversityScore = Math.sqrt(firstBranches.size) * Math.log2(2 + directOut);
-    const sourceBias = 1 / Math.sqrt(1 + upstreamCount * 0.65);
-    const trailblazerScore = (reachScore * 0.42 + rootScore * 0.34 + bridgeScore * 0.16 + diversityScore * 0.08) * sourceBias;
-    if (trailblazerScore > 0) {
-      scores.push({
-        node,
-        score: trailblazerScore,
-        reachScore,
-        rootScore,
-        bridgeScore,
-        diversityScore,
-        downstream: seen.size - 1,
-        directOut,
-        upstreamCount
-      });
-    }
-  }
-  const sorted = scores.sort((a, b) => b.score - a.score);
-  state.rootMetricsCache = {
-    version: state.graphAnalysisVersion,
-    limit: Math.max(requestedLimit, 20),
-    scores: sorted.slice(0, Math.max(requestedLimit, 20))
-  };
-  return state.rootMetricsCache.scores.slice(0, requestedLimit);
-}
-
-function componentMapExcluding(excludedId) {
-  const adjacency = new Map([...state.nodes.keys()].map(id => [id, []]));
-  for (const edge of allGraphEdges()) {
-    if (edge.from.id === excludedId || edge.to.id === excludedId) continue;
-    if (adjacency.has(edge.from.id)) adjacency.get(edge.from.id).push(edge.to.id);
-    if (adjacency.has(edge.to.id)) adjacency.get(edge.to.id).push(edge.from.id);
-  }
-  const components = new Map();
-  let component = 0;
-  for (const id of adjacency.keys()) {
-    if (id === excludedId || components.has(id)) continue;
-    component += 1;
-    const stack = [id];
-    components.set(id, component);
-    while (stack.length) {
-      const current = stack.pop();
-      for (const next of adjacency.get(current) || []) {
-        if (next === excludedId || components.has(next)) continue;
-        components.set(next, component);
-        stack.push(next);
-      }
-    }
-  }
-  return components;
+    };
+    const fail = () => { cleanup(); reject(new Error("Graph analysis worker failed")); };
+    const timeout = window.setTimeout(() => { cleanup(); reject(new Error("Graph analysis timed out")); }, 30000);
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      analysisWorker.removeEventListener("message", receive);
+      analysisWorker.removeEventListener("error", fail);
+      analysisRequests.delete(key);
+    };
+    analysisWorker.addEventListener("message", receive);
+    analysisWorker.addEventListener("error", fail);
+    const submitStarted = performance.now();
+    const graph = workerVersion !== version ? analysisSnapshot() : undefined;
+    analysisWorker.postMessage({ id, version, kind, targetId, graph });
+    const panel = kind === "next" ? els.nextOutput : els.rootsOutput;
+    panel.dataset.analysisSubmitMs = (performance.now() - submitStarted).toFixed(2);
+    workerVersion = version;
+  });
+  analysisRequests.set(key, promise);
+  return promise;
 }
 
 function expansionRecommendations(limit = 12) {
-  const requestedLimit = Math.max(1, Number(limit) || 12);
-  if (
-    state.expansionRecommendationsCache
-    && state.expansionRecommendationsCache.version === state.graphAnalysisVersion
-    && state.expansionRecommendationsCache.limit >= requestedLimit
-  ) {
-    return state.expansionRecommendationsCache.items.slice(0, requestedLimit);
-  }
+  return state.expansionRecommendationsCache?.version === state.graphAnalysisVersion
+    ? state.expansionRecommendationsCache.items.filter(item => !state.expanded.has(item.node.id) && !state.expanding.has(item.node.id)).slice(0, limit) : [];
+}
 
-  const edges = allGraphEdges();
-  const stats = new Map([...state.nodes.values()].map(node => [node.id, {
-    node,
-    observations: 0,
-    confidenceSum: 0,
-    neighbors: new Set(),
-    sourceEntities: new Set(),
-    incoming: 0,
-    outgoing: 0
-  }]));
-  for (const obs of state.observations) {
-    const from = keyFor(obs.from);
-    const to = keyFor(obs.to);
-    const confidence = Math.max(0, Math.min(1, Number(obs.confidence) || 0));
-    if (stats.has(from)) {
-      const item = stats.get(from);
-      item.observations += 1;
-      item.confidenceSum += confidence;
-      item.neighbors.add(to);
-      item.outgoing += 1;
-      if (obs.sourceEntity) item.sourceEntities.add(keyFor(obs.sourceEntity));
-    }
-    if (stats.has(to)) {
-      const item = stats.get(to);
-      item.observations += 1;
-      item.confidenceSum += confidence;
-      item.neighbors.add(from);
-      item.incoming += 1;
-      if (obs.sourceEntity) item.sourceEntities.add(keyFor(obs.sourceEntity));
-    }
-  }
+function globalInfluenceMetrics(limit = 10) {
+  return state.rootMetricsCache?.version === state.graphAnalysisVersion ? state.rootMetricsCache.scores.slice(0, limit) : [];
+}
 
-  const items = [];
-  for (const stat of stats.values()) {
-    const node = stat.node;
-    if (state.expanded.has(node.id) || state.expanding.has(node.id) || !stat.observations) continue;
-    const components = componentMapExcluding(node.id);
-    const neighborComponents = new Set();
-    const spatialSectors = new Set();
-    for (const neighborId of stat.neighbors) {
-      const component = components.get(neighborId);
-      if (component) neighborComponents.add(component);
-      const neighbor = state.nodes.get(neighborId);
-      if (neighbor) {
-        const angle = Math.atan2(neighbor.y - node.y, neighbor.x - node.x);
-        spatialSectors.add(Math.floor(((angle + Math.PI) / (Math.PI * 2)) * 8));
-      }
-    }
-    const regionCount = Math.max(1, neighborComponents.size, spatialSectors.size);
-    const avgConfidence = stat.confidenceSum / Math.max(1, stat.observations);
-    const connectedEdges = edges.filter(edge => edge.from.id === node.id || edge.to.id === node.id);
-    const strongLinks = connectedEdges.filter(edge => edge.confidence >= 0.55).length;
-    const name = canonicalName(node.name);
-    const hasQualifier = /\(|\[|\b(1[0-9]{3}|20[0-9]{2})\b/.test(node.name);
-    const shortName = name.split(" ").filter(Boolean).length <= 2;
-    const ambiguityScore = shortName && !hasQualifier && stat.observations >= 2 ? 1 : 0;
-    const recurrenceScore = Math.log2(1 + stat.observations) * 1.25;
-    const bridgeScore = Math.log2(1 + regionCount) * Math.sqrt(1 + stat.neighbors.size);
-    const sourceScore = Math.log2(1 + stat.sourceEntities.size);
-    const confidenceScore = avgConfidence * 1.4;
-    const directionScore = stat.incoming && stat.outgoing ? 0.75 : 0.25;
-    const strongLinkScore = Math.log2(1 + strongLinks) * 0.5;
-    const value = recurrenceScore + bridgeScore + sourceScore + confidenceScore + directionScore + strongLinkScore + ambiguityScore;
-    const reasons = [];
-    if (regionCount > 1) reasons.push(`touches ${regionCount} map neighborhoods`);
-    if (stat.sourceEntities.size > 1) reasons.push(`seen from ${stat.sourceEntities.size} sampled entities`);
-    if (stat.incoming && stat.outgoing) reasons.push("has both incoming and outgoing hints");
-    if (ambiguityScore) reasons.push("short or ambiguous name may clarify identity");
-    if (!reasons.length) reasons.push("unexpanded frontier node with existing evidence");
-    items.push({
-      node,
-      value,
-      observations: stat.observations,
-      connections: stat.neighbors.size,
-      avgConfidence,
-      regions: regionCount,
-      reasons
-    });
-  }
+function cachedTraceRoots(id) {
+  return state.rootTraceCache.get(state.graphAnalysisVersion + ":" + id) || null;
+}
 
-  const sorted = items.sort((a, b) => b.value - a.value || b.observations - a.observations || a.node.name.localeCompare(b.node.name));
-  state.expansionRecommendationsCache = {
-    version: state.graphAnalysisVersion,
-    limit: Math.max(requestedLimit, 30),
-    items: sorted.slice(0, Math.max(requestedLimit, 30))
-  };
-  return state.expansionRecommendationsCache.items.slice(0, requestedLimit);
+function ensureNextAnalysis() {
+  if (state.expansionRecommendationsCache?.version === state.graphAnalysisVersion) return Promise.resolve();
+  return requestAnalysis("next").then(({ version, result }) => {
+    if (version !== state.graphAnalysisVersion) return;
+    state.expansionRecommendationsCache = { version, items: result };
+    if (state.panelTab === "next") renderNextPanel();
+  });
+}
+
+function ensureRootAnalysis(id) {
+  if (state.rootMetricsCache?.version === state.graphAnalysisVersion && (!id || cachedTraceRoots(id))) return;
+  requestAnalysis("roots", id).then(({ version, result }) => {
+    if (version !== state.graphAnalysisVersion) return;
+    state.rootMetricsCache = { version, scores: result.metrics };
+    if (id) state.rootTraceCache.set(version + ":" + id, result.trace);
+    if (state.panelTab === "roots") renderRootsPanel();
+    markRenderDirty();
+  }).catch(error => { els.rootsOutput.textContent = error.message; });
 }
 
 function metricBars(item) {
@@ -820,19 +503,24 @@ function metricBars(item) {
 function expansionValueBars(item) {
   const values = [
     ["Regions", item.regions],
-    ["Evidence", item.observations],
-    ["Confidence", item.avgConfidence * 10],
+    ["Samples", item.observations],
+    ["Mean score", item.avgConfidence * 10],
     ["Links", item.connections]
   ];
   const max = Math.max(1, ...values.map(([, value]) => Number(value) || 0));
   return `<div class="metric-bars next-bars">${values.map(([label, value]) => `
-    <span><b style="width:${Math.max(4, Math.min(100, (Number(value || 0) / max) * 100)).toFixed(0)}%"></b>${label} ${label === "Confidence" ? `${Math.round(item.avgConfidence * 100)}%` : Number(value || 0).toFixed(0)}</span>
+    <span><b style="width:${Math.max(4, Math.min(100, (Number(value || 0) / max) * 100)).toFixed(0)}%"></b>${label} ${label === "Mean score" ? item.avgConfidence.toFixed(2) : Number(value || 0).toFixed(0)}</span>
   `).join("")}</div>`;
 }
 
 function renderNextPanel() {
   if (!els.nextOutput) return;
   if (state.panelTab !== "next") return;
+  if (state.expansionRecommendationsCache?.version !== state.graphAnalysisVersion) {
+    els.nextOutput.textContent = "Calculating expansion suggestions in the background...";
+    ensureNextAnalysis().catch(error => { els.nextOutput.textContent = error.message; });
+    return;
+  }
   const items = expansionRecommendations(12);
   if (!items.length) {
     els.nextOutput.innerHTML = `
@@ -842,8 +530,8 @@ function renderNextPanel() {
   }
   els.nextOutput.innerHTML = `
     <div class="roots-summary">
-      <strong>Highest expected expansion value</strong>
-      <span>Local math only: no model call is used to rank these. It favors nodes that may connect regions, repeat across observations, or clarify ambiguous names.</span>
+      <strong>Expansion suggestions</strong>
+      <span>This heuristic uses graph topology and sample history. It favors nodes that may connect regions, repeat across observations, or clarify ambiguous names.</span>
     </div>
     <ol class="next-list">${items.map(item => `
       <li>
@@ -851,7 +539,7 @@ function renderNextPanel() {
         <span>value ${item.value.toFixed(2)} - ${item.observations} observation${item.observations === 1 ? "" : "s"} - ${item.connections} connection${item.connections === 1 ? "" : "s"}</span>
         <p>${escapeHtml(item.reasons.join("; "))}</p>
         ${expansionValueBars(item)}
-        <button type="button" data-next-expand="${escapeHtml(item.node.id)}">Expand this next</button>
+        <button type="button" data-next-expand="${escapeHtml(item.node.id)}" ${state.canWrite ? "" : "disabled"}>Expand this next</button>
       </li>
     `).join("")}</ol>
   `;
@@ -864,6 +552,7 @@ function renderRootsPanel() {
     return;
   }
   const selectedId = selectedNodeId();
+  ensureRootAnalysis(selectedId);
   const trailblazers = globalInfluenceMetrics(10);
   if (!selectedId) {
     state.rootTrace = null;
@@ -879,13 +568,13 @@ function renderRootsPanel() {
   const trace = cachedTraceRoots(selectedId);
   state.rootTrace = trace;
   if (!trace) {
-    els.rootsOutput.textContent = "No root trace available.";
+    els.rootsOutput.textContent = "Calculating upstream paths in the background...";
     return;
   }
   const rootRows = trace.roots.length ? trace.roots.map(root => `
     <li>
       <button type="button" data-root-node="${escapeHtml(root.node.id)}">${escapeHtml(root.node.name)}</button>
-      <span>root score ${root.score.toFixed(2)} - ${root.paths} path${root.paths === 1 ? "" : "s"} - depth ${root.maxDepth}</span>
+      <span>root score ${root.score.toFixed(2)} - ${root.paths} path${root.paths === 1 ? "" : "s"} - depth ${root.maxDepth} - ${escapeHtml(root.terminalReason)}</span>
     </li>
   `).join("") : `<li><span>No upstream roots found yet. Expand influences around ${escapeHtml(trace.target.name)} to grow the lineage.</span></li>`;
   const pathRows = trace.paths.length ? trace.paths.map(path => `
@@ -897,9 +586,9 @@ function renderRootsPanel() {
   els.rootsOutput.innerHTML = `
     <div class="roots-summary">
       <strong>${escapeHtml(trace.target.name)}</strong>
-      <span>${trace.roots.length} candidate root${trace.roots.length === 1 ? "" : "s"} from ${trace.paths.length} strongest lineage path${trace.paths.length === 1 ? "" : "s"}.</span>
+      <span>${trace.roots.length} candidate root${trace.roots.length === 1 ? "" : "s"} from ${trace.paths.length} heuristic upstream path${trace.paths.length === 1 ? "" : "s"}.</span>
     </div>
-    <h3>Likely Roots</h3>
+    <h3>Candidate upstream endpoints</h3>
     <ol class="roots-list">${rootRows}</ol>
     ${pathRows ? `<h3>Strongest Paths</h3><ol class="roots-paths">${pathRows}</ol>` : ""}
     <h3>Global Trailblazers</h3>
@@ -911,9 +600,9 @@ function renderRootsPanel() {
 
 function renderEntityTable() {
   if (!els.tableBody) return;
-  const filter = canonicalName(state.tableFilter);
+  const filter = keyFor(state.tableFilter);
   const rows = entityStats()
-    .filter(item => !filter || canonicalName(item.name).includes(filter) || item.aliases.some(alias => canonicalName(alias).includes(filter)))
+    .filter(item => !filter || keyFor(item.name).includes(filter) || item.aliases.some(alias => keyFor(alias).includes(filter)))
     .sort((a, b) => {
       const direction = state.tableDirection === "asc" ? 1 : -1;
       if (state.tableSort === "name") return a.name.localeCompare(b.name) * direction;
@@ -935,7 +624,7 @@ function renderEntityTable() {
   for (const item of rows) {
     const row = document.createElement("tr");
     row.innerHTML = `
-      <td><button type="button" data-node="${item.id}">${item.name}</button></td>
+      <td><button type="button" data-node="${escapeHtml(item.id)}">${escapeHtml(item.name)}</button></td>
       <td>${item.connectionCount}</td>
       <td>${item.incoming}</td>
       <td>${item.outgoing}</td>
@@ -949,10 +638,11 @@ function renderEntityTable() {
 
 function resizeCanvas() {
   const rect = canvas.getBoundingClientRect();
-  const scale = window.devicePixelRatio || 1;
+  const scale = Math.min(window.devicePixelRatio || 1, 1.35);
   canvas.width = Math.max(600, Math.floor(rect.width * scale));
   canvas.height = Math.max(420, Math.floor(rect.height * scale));
   ctx.setTransform(scale, 0, 0, scale, 0, 0);
+  markRenderDirty();
 }
 
 function setStatus(message) {
@@ -1047,45 +737,6 @@ function profileTotal(profile) {
     ? profile.timings.find(item => item && item.stage === "total")
     : null;
   return total ? total.ms : 0;
-}
-
-function renderDiagnosticsLegacy(payload = state.diagnostics) {
-  if (!els.diagnosticsOutput) return;
-  if (!payload) {
-    els.diagnosticsOutput.textContent = "Diagnostics have not loaded yet.";
-    return;
-  }
-  const queue = payload.llmQueue || {};
-  const counts = payload.counts || {};
-  const profiles = Array.isArray(payload.profiles) ? payload.profiles.slice(0, 12) : [];
-  const profileRows = profiles.length ? profiles.map(profile => {
-    const llm = profile.llm || {};
-    const usage = profile.usage && profile.usage.expansion ? profile.usage.expansion : {};
-    const status = profile.error ? "failed" : "done";
-    return `
-      <div class="diagnostic-profile ${status}">
-        <strong>${escapeHtml(profile.entity || profile.type || "event")}</strong>
-        <span>${escapeHtml(profile.type || "profile")} · ${escapeHtml(profile.provider || "")}/${escapeHtml(profile.model || "")}</span>
-        <span>Total ${escapeHtml(formatMs(profileTotal(profile)))} · Request ${escapeHtml(formatMs(llm.expansionRequestMs || llm.identityRequestMs))} · Queue ${escapeHtml(formatMs(llm.expansionQueueMs || llm.identityQueueMs || 0))}</span>
-        <span>Tokens ${Number(usage.totalTokens || 0)} · reasoning ${Number(usage.reasoningTokens || 0)} · ${escapeHtml(activityTime(profile.at))}</span>
-        ${profile.error ? `<em>${escapeHtml(profile.error)}</em>` : ""}
-      </div>
-    `;
-  }).join("") : "<p>No profiles recorded yet.</p>";
-  els.diagnosticsOutput.innerHTML = `
-    <div class="diagnostic-grid">
-      <div><span>Provider</span><strong>${escapeHtml(payload.provider || "mock")}</strong></div>
-      <div><span>Model</span><strong>${escapeHtml(payload.model || "none")}</strong></div>
-      <div><span>Thinking</span><strong>${escapeHtml(payload.thinking || "n/a")}</strong></div>
-      <div><span>JSON mode</span><strong>${payload.openRouterJsonMode ? "Fast" : "Strict"}</strong></div>
-      <div><span>Queue</span><strong>${Number(queue.active || 0)} active / ${Number(queue.queued || 0)} waiting</strong></div>
-      <div><span>Timeout</span><strong>${escapeHtml(formatMs(queue.timeoutMs))}</strong></div>
-      <div><span>Database</span><strong>${Number(counts.nodes || 0)} nodes / ${Number(counts.observations || 0)} obs</strong></div>
-      <div><span>Profile errors</span><strong>${Number(counts.errors || 0)}</strong></div>
-    </div>
-    <h3>Recent Model Runs</h3>
-    <div class="diagnostic-profiles">${profileRows}</div>
-  `;
 }
 
 function renderDiagnostics(payload = state.diagnostics) {
@@ -1339,25 +990,13 @@ function renderActivityList() {
   updateOverview();
 }
 
-function serializeGraph() {
-  return {
-    nodes: [...state.nodes.values()].map(node => ({
-      name: node.name,
-      aliases: node.aliases || [],
-      x: node.x,
-      y: node.y
-    })),
-    observations: state.observations.map(observation => ({ ...observation })),
-    expanded: [...state.expanded],
-    pan: { ...state.pan },
-    zoom: state.zoom,
-    minConfidence: state.minConfidence
-  };
-}
-
 function hydrateGraph(graph) {
-  const minConfidence = Number(graph && graph.minConfidence);
-  const zoom = Number(graph && graph.zoom);
+  const previous = new Map([...state.nodes.values()].filter(node => node.uid).map(node => [node.uid, { x: node.x, y: node.y }]));
+  const selectedUid = state.selected?.type === "node" ? state.nodes.get(state.selected.id)?.uid : null;
+  const view = state.loaded ? { pan: state.pan, zoom: state.zoom, minConfidence: state.minConfidence, positions: Object.fromEntries(previous) } : readLocalView();
+  const minConfidence = Number(view.minConfidence ?? graph?.minConfidence);
+  const zoom = Number(view.zoom ?? graph?.zoom);
+  state.revision = Number(graph.revision) || state.revision;
   state.nodes.clear();
   state.observations = [];
   state.edges.clear();
@@ -1365,8 +1004,8 @@ function hydrateGraph(graph) {
   state.expanded.clear();
   state.selected = null;
   state.pan = {
-    x: Number(graph && graph.pan && graph.pan.x) || 0,
-    y: Number(graph && graph.pan && graph.pan.y) || 0
+    x: Number(view.pan?.x ?? graph?.pan?.x) || 0,
+    y: Number(view.pan?.y ?? graph?.pan?.y) || 0
   };
   state.zoom = Number.isFinite(zoom) ? clampZoom(zoom) : 1;
   state.minConfidence = Number.isFinite(minConfidence) ? Math.max(0, Math.min(1, minConfidence)) : 0;
@@ -1375,9 +1014,10 @@ function hydrateGraph(graph) {
   for (const node of Array.isArray(graph && graph.nodes) ? graph.nodes : []) {
     const hydrated = ensureNode(node.name);
     if (!hydrated) continue;
+    hydrated.uid = node.uid;
     hydrated.aliases = Array.isArray(node.aliases) ? node.aliases.map(displayName).filter(Boolean) : hydrated.aliases;
-    const x = Number(node.x);
-    const y = Number(node.y);
+    const x = Number(view.positions?.[node.uid]?.x ?? node.x);
+    const y = Number(view.positions?.[node.uid]?.y ?? node.y);
     hydrated.x = Number.isFinite(x) ? x : hydrated.x;
     hydrated.y = Number.isFinite(y) ? y : hydrated.y;
     hydrated.vx = 0;
@@ -1391,9 +1031,11 @@ function hydrateGraph(graph) {
     ensureNode(from);
     ensureNode(to);
     state.observations.push({
+      id: observation.id, fromUid: observation.fromUid, toUid: observation.toUid,
+      evidenceType: observation.evidenceType || "unknown", sources: observation.sources || [],
       from,
       to,
-      confidence: Math.max(0, Math.min(1, Number(observation.confidence) || 0.5)),
+      confidence: Math.max(0, Math.min(1, Number.isFinite(Number(observation.confidence)) ? Number(observation.confidence) : 0.5)),
       sourceEntity: displayName(observation.sourceEntity || ""),
       provider: displayName(observation.provider || ""),
       model: displayName(observation.model || ""),
@@ -1406,8 +1048,13 @@ function hydrateGraph(graph) {
     if (key) state.expanded.add(key);
   }
 
+  if (selectedUid) {
+    const selected = [...state.nodes.values()].find(node => node.uid === selectedUid);
+    if (selected) state.selected = { type: "node", id: selected.id };
+  }
   invalidateGraphAnalysis();
   recomputeEdges();
+  markRenderDirty();
 }
 
 async function loadGraph() {
@@ -1418,6 +1065,9 @@ async function loadGraph() {
     hydrateGraph(payload.data);
     state.loaded = true;
     const count = state.observations.length;
+    if (count && !visibleNodeCount()) {
+      fitGraph();
+    }
     setStatus(count ? `Loaded saved graph with ${count} observations.` : "Ready.");
   } catch (error) {
     state.loaded = true;
@@ -1431,34 +1081,57 @@ async function loadConfig() {
     const response = await fetch("/api/config", { headers: adminHeaders() });
     const config = await response.json();
     state.devTools = Boolean(config.devTools);
+    state.canWrite = Boolean(config.canWrite);
     document.body.classList.toggle("dev-tools", state.devTools);
-    if (state.devTools) loadDedupeSuggestions().catch(() => {});
   } catch (error) {
     state.devTools = false;
     document.body.classList.remove("dev-tools");
   }
 }
 
-async function saveGraph() {
+function readLocalView() {
+  try { return JSON.parse(window.localStorage.getItem("influenceMapView") || "{}"); } catch { return {}; }
+}
+
+async function saveView() {
   if (!state.loaded) return;
-  const version = ++state.saveVersion;
-  const response = await fetch("/api/graph", {
-    method: "PUT",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(serializeGraph())
-  });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Save failed");
-  if (version === state.saveVersion) {
-    setStatus(`Saved graph at ${new Date(payload.data.savedAt).toLocaleTimeString()}.`);
+  const positions = Object.fromEntries([...state.nodes.values()].filter(node => node.uid).map(node => [node.uid, { x: node.x, y: node.y }]));
+  window.localStorage.setItem("influenceMapView", JSON.stringify({ pan: state.pan, zoom: state.zoom, minConfidence: state.minConfidence, positions }));
+}
+
+async function acceptServerPayload(payload) {
+  const full = payload.graph || (payload.data?.nodes ? payload.data : null);
+  if (full) {
+    if (Number(full.revision) >= state.revision) hydrateGraph(full);
+    return;
   }
+  const deltas = Array.isArray(payload.changes) ? payload.changes : payload.changes ? [payload.changes] : [];
+  for (const delta of deltas) {
+    if (delta.revision <= state.revision) continue;
+    if (delta.fromRevision !== state.revision) { await refreshGraph(); return; }
+    const nodes = new Map([...state.nodes.values()].map(node => [node.uid, node]));
+    for (const uid of delta.removedNodeUids) nodes.delete(uid);
+    for (const node of delta.nodes) nodes.set(node.uid, node);
+    const observations = new Map(state.observations.map(observation => [observation.id, observation]));
+    for (const id of delta.removedObservationIds) observations.delete(id);
+    for (const observation of delta.observations) observations.set(observation.id, observation);
+    hydrateGraph({ nodes: [...nodes.values()], observations: [...observations.values()], expanded: delta.expanded, revision: delta.revision });
+  }
+}
+
+async function refreshGraph() {
+  const response = await fetch("/api/graph?since=" + state.revision);
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Graph refresh failed");
+  await acceptServerPayload(payload);
+  updateUi();
 }
 
 function scheduleSave() {
   if (!state.loaded) return;
   window.clearTimeout(state.saveTimer);
   state.saveTimer = window.setTimeout(() => {
-    saveGraph().catch(error => setStatus(`Could not save graph: ${error.message}`));
+    saveView().catch(error => setStatus(`Could not save this browser's view: ${error.message}`));
   }, 350);
 }
 
@@ -1471,9 +1144,7 @@ function expansionContextFor(node) {
     const fromId = keyFor(obs.from);
     const toId = keyFor(obs.to);
     if (fromId !== node.id && toId !== node.id) continue;
-    const relation = fromId === node.id
-      ? `${obs.from} influenced ${obs.to}`
-      : `${obs.from} influenced ${obs.to}`;
+    const relation = `${obs.from} influenced ${obs.to}`;
     const otherName = fromId === node.id ? obs.to : obs.from;
     const sourceEntity = displayName(obs.sourceEntity || "");
     const item = {
@@ -1503,10 +1174,10 @@ async function fetchInfluences(entity, context = {}) {
   const response = await fetch("/api/influences", {
     method: "POST",
     headers: { "content-type": "application/json", ...adminHeaders() },
-    body: JSON.stringify({ entity, context })
+    body: JSON.stringify({ entity, context, revision: state.revision, requestId: crypto.randomUUID() })
   });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Request failed");
+  if (!response.ok) { if (response.status === 409) await refreshGraph(); throw new Error(payload.error || "Request failed"); }
   return payload;
 }
 
@@ -1523,6 +1194,12 @@ async function fetchInfluencePrompt(entity, context = {}) {
 }
 
 function reviewExplanation(item) {
+  if (item.action === "rename") return {
+    title: "Rename to " + item.canonical, badge: "Rename", approveLabel: "Rename this entity",
+    summary: "Change the display identity while retaining its permanent ID.",
+    change: "Rename " + item.entities[0] + " to " + item.canonical + "; preserve samples and record the old name as an alias.",
+    reject: "Reject if these names describe different entities."
+  };
   const entities = (item.entities || []).map(displayName).filter(Boolean);
   const canonical = displayName(item.canonical || entities[0] || "");
   const source = entities.find(name => keyFor(name) !== keyFor(canonical)) || entities[0] || "";
@@ -1577,7 +1254,7 @@ function renderDedupeSuggestions(suggestions) {
     updateIdentityFilterButtons([]);
     state.identitySuggestions = [];
     updateOverview();
-    els.dedupeOutput.textContent = "No unresolved identity decisions. Automatic merge, split, and rename handling is keeping up.";
+    els.dedupeOutput.textContent = "No pending identity decisions. Model-generated relationships still require independent verification.";
     return;
   }
   state.identitySuggestions = suggestions;
@@ -1595,7 +1272,8 @@ function renderDedupeSuggestions(suggestions) {
     return;
   }
   els.dedupeOutput.innerHTML = visible.map(item => {
-    const moveCandidates = item.metadata && Array.isArray(item.metadata.moveCandidates) ? item.metadata.moveCandidates : [];
+    const sourceKey = keyFor(item.entities?.find(name => keyFor(name) !== keyFor(item.canonical)));
+    const moveCandidates = item.action === "split" ? state.observations.filter(observation => keyFor(observation.from) === sourceKey || keyFor(observation.to) === sourceKey) : [];
     const review = reviewExplanation(item);
     return `
     <div class="dedupe-group ${escapeHtml(item.action || "identity")}" data-suggestion="${item.id}">
@@ -1610,10 +1288,11 @@ function renderDedupeSuggestions(suggestions) {
         <span>Result if approved</span>
         <strong>${escapeHtml(review.change)}</strong>
       </div>
-      <span>${Math.round(Number(item.confidence || 0) * 100)}% confidence - ${escapeHtml(item.reason || "Identity decision")}</span>
+      <span>${Number(item.confidence || 0).toFixed(2)} identity score - ${escapeHtml(item.reason || "Identity decision")}</span>
       ${moveCandidates.length ? `<ul class="move-candidates">${moveCandidates.map(candidate => `
-        <li>${escapeHtml(candidate.from)} -> ${escapeHtml(candidate.to)} <span>${Math.round(Number(candidate.confidence || 0) * 100)}%</span></li>
+        <li>Sample #${Number(candidate.id)}: ${escapeHtml(candidate.from)} → ${escapeHtml(candidate.to)} <span>${Math.round(Number(candidate.confidence || 0) * 100)}%</span></li>
       `).join("")}</ul>` : ""}
+      ${item.action === "split" ? `<label>Sample IDs to move (comma-separated)<input data-split-ids="${Number(item.id)}" value="${escapeHtml((item.metadata?.moveObservationIds || []).join(", "))}" autocomplete="off"></label>` : ""}
       <details class="dedupe-review-details">
         <summary>How to decide</summary>
         <p>${escapeHtml(review.reject)}</p>
@@ -1628,43 +1307,27 @@ function renderDedupeSuggestions(suggestions) {
 }
 
 async function loadDedupeSuggestions() {
-  let autoIdentity = null;
-  if (state.devTools) {
-    const autoResponse = await fetch("/api/dedupe-auto-resolve", {
-      method: "POST",
-      headers: adminHeaders()
-    });
-    const autoPayload = await autoResponse.json();
-    if (autoResponse.ok) {
-      autoIdentity = autoPayload.autoIdentity || null;
-      if (autoPayload.data) hydrateGraph(autoPayload.data);
-    }
-  }
   const response = await fetch("/api/dedupe-suggestions", { headers: adminHeaders() });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Could not load identity decisions");
   state.identitySuggestions = payload.suggestions || [];
-  renderDedupeSuggestions(payload.suggestions || []);
-  autoIdentity = autoIdentity || payload.autoIdentity || {};
-  const applied = Number(autoIdentity.applied || 0);
-  const cleared = Number(autoIdentity.clearedChecks || 0);
-  if (applied || cleared) {
-    setStatus(`Automatic identity cleanup handled ${applied} edit${applied === 1 ? "" : "s"} and cleared ${cleared} check${cleared === 1 ? "" : "s"}.`);
-  }
+  renderDedupeSuggestions(state.identitySuggestions);
 }
 
 async function decideDedupeSuggestion(id, action) {
   const activityId = addActivity("identity", action === "approve" ? "Approving identity decision" : "Rejecting identity decision", `Suggestion ${id}`, "running");
   const response = await fetch(`/api/dedupe-suggestions/${id}/${action}`, {
     method: "POST",
-    headers: adminHeaders()
+    headers: { "content-type": "application/json", ...adminHeaders() },
+    body: JSON.stringify({ revision: state.revision, ...(action === "approve" && document.querySelector(`[data-split-ids="${Number(id)}"]`) ? { moveObservationIds: document.querySelector(`[data-split-ids="${Number(id)}"]`).value.split(",").map(value => value.trim()).filter(Boolean).map(Number) } : {}) })
   });
   const payload = await response.json();
   if (!response.ok) {
+    if (response.status === 409) await refreshGraph();
     updateActivity(activityId, { status: "failed", detail: payload.error || "Identity decision failed" });
     throw new Error(payload.error || "Identity decision failed");
   }
-  if (payload.data) hydrateGraph(payload.data);
+  await acceptServerPayload(payload);
   state.identitySuggestions = payload.suggestions || [];
   renderDedupeSuggestions(state.identitySuggestions);
   updateUi();
@@ -1716,11 +1379,12 @@ async function cleanOrphanNodes() {
   }
   const response = await fetch("/api/orphans", {
     method: "DELETE",
-    headers: adminHeaders()
+    headers: { "content-type": "application/json", ...adminHeaders() },
+    body: JSON.stringify({ revision: state.revision })
   });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error || "Could not clean orphan nodes");
-  if (payload.data) hydrateGraph(payload.data);
+  await acceptServerPayload(payload);
   if (els.cleanOrphans) els.cleanOrphans.disabled = true;
   els.dedupeOutput.textContent = `Removed ${payload.removed || 0} orphan node${Number(payload.removed || 0) === 1 ? "" : "s"}.`;
   setStatus(`Removed ${payload.removed || 0} orphan node${Number(payload.removed || 0) === 1 ? "" : "s"}.`);
@@ -1728,6 +1392,7 @@ async function cleanOrphanNodes() {
 }
 
 async function expandEntity(entity, options = {}) {
+  if (!state.canWrite) throw new Error("Generation requires the private write-access link shown by the server.");
   let node = ensureNode(entity);
   if (!node) return;
   if (state.expanding.has(node.id)) return;
@@ -1753,6 +1418,7 @@ async function expandEntity(entity, options = {}) {
   let slowProviderTimer = 0;
   let verySlowProviderTimer = 0;
   try {
+    const wasExpanded = state.expanded.has(node.id);
     const beforeNodeCount = state.nodes.size;
     const beforeEdgeCount = state.edges.size + state.hiddenEdges.size;
     const beforeObservationCount = state.observations.length;
@@ -1787,10 +1453,9 @@ async function expandEntity(entity, options = {}) {
     window.clearTimeout(verySlowProviderTimer);
     slowProviderTimer = 0;
     verySlowProviderTimer = 0;
-    if (payload.graph) {
-      hydrateGraph(payload.graph);
-      node = ensureNode(payload.data && payload.data.entity ? payload.data.entity : entity) || ensureNode(entity);
-    }
+    await acceptServerPayload(payload);
+    node = [...state.nodes.values()].find(candidate => candidate.uid === payload.entityUid) || state.nodes.get(keyFor(payload.data.entity)) || ensureNode(payload.data.entity);
+    state.selected = { type: "node", id: node.id };
     if (payload.debugPrompt) updateActivity(activityId, { prompt: payload.debugPrompt });
     if (payload.identity) {
       const identityPercent = Math.round(Number(payload.identity.confidence || 0) * 100);
@@ -1799,29 +1464,10 @@ async function expandEntity(entity, options = {}) {
         stages: ["Identity resolved", "Applying graph observations", "Queuing identity review"]
       });
     }
-    if ((payload.identitySuggestions || payload.localHygieneSuggestions || payload.llmHygieneSuggestions) && state.devTools) {
-      loadDedupeSuggestions().catch(() => {});
-    }
     const data = payload.data;
-    const canonicalNode = renameNode(node, data.entity);
-    const canonicalEntity = canonicalNode ? canonicalNode.name : displayName(data.entity || node.name);
+    const canonicalEntity = data.entity;
     const relationships = [...(data.influencedBy || []), ...(data.influenced || [])];
-
-    for (const item of data.influencedBy || []) {
-      addObservation(item.entity, canonicalEntity, item.confidence, {
-        sourceEntity: canonicalEntity,
-        provider: payload.provider,
-        model: payload.model
-      });
-    }
-    for (const item of data.influenced || []) {
-      addObservation(canonicalEntity, item.entity, item.confidence, {
-        sourceEntity: canonicalEntity,
-        provider: payload.provider,
-        model: payload.model
-      });
-    }
-
+    if (state.devTools) loadDedupeSuggestions().catch(() => {});
     const addedObservations = state.observations.length - beforeObservationCount;
     const addedNodes = state.nodes.size - beforeNodeCount;
     const addedEdges = (state.edges.size + state.hiddenEdges.size) - beforeEdgeCount;
@@ -1835,8 +1481,6 @@ async function expandEntity(entity, options = {}) {
       return;
     }
 
-    const wasExpanded = state.expanded.has(keyFor(canonicalEntity));
-    state.expanded.add(keyFor(canonicalEntity));
     const shapeChanged = addedNodes > 0 || addedEdges > 0;
     const resultTitle = shapeChanged
       ? `${wasExpanded ? "Sampled" : "Expanded"} ${canonicalEntity}`
@@ -1858,7 +1502,9 @@ async function expandEntity(entity, options = {}) {
     const llm = payload.llm || {};
     const providerMs = Number(llm.expansionRequestMs || 0);
     const providerDetail = providerMs >= SLOW_LLM_MS ? ` Provider wait: ${formatMs(providerMs)}.` : "";
-    const hygieneDetail = payload.hygieneQueued ? " LLM identity hygiene queued after expansion." : "";
+    const hygieneDetail = payload.scopedIdentityReview?.warning
+      ? ` Identity review deferred: ${payload.scopedIdentityReview.warning}. Samples were saved.`
+      : payload.hygieneQueued ? " Identity review completed." : "";
     updateActivity(activityId, {
       status: "done",
       title: resultTitle,
@@ -1868,7 +1514,7 @@ async function expandEntity(entity, options = {}) {
     });
     setStatus(shapeChanged
       ? `${wasExpanded ? "Sampled" : "Expanded"} ${canonicalEntity} using ${payload.provider}/${payload.model}.`
-      : `${canonicalEntity} returned existing relationships only; confidence evidence was reinforced but the map shape did not grow.`);
+      : `${canonicalEntity} returned existing relationships only; model sampling was repeated but the map shape did not grow.`);
     scheduleSave();
     window.setTimeout(scheduleSave, 2500);
     if (state.panelTab === "diagnostics") loadDiagnostics().catch(() => {});
@@ -1889,15 +1535,25 @@ async function searchEntity(entity) {
   if (state.searching) return;
   const query = displayName(entity);
   if (!query) return;
+  if (state.view !== "graph") setView("graph");
   state.searching = true;
   els.focusEntity.disabled = true;
   try {
-    const existing = findNodeByQuery(query);
+    const matches = findNodesByQuery(query);
+    if (matches.length > 1) {
+      state.selected = null;
+      setPanelTab("selected");
+      els.selectedDetails.innerHTML = "<p>Choose the intended entity, or enter a more specific name.</p>" + matches.slice(0, 12).map(node => `<button type="button" data-search-choice="${escapeHtml(node.id)}">${escapeHtml(node.name)}</button>`).join("");
+      setStatus(matches.length + " existing entities match this query.");
+      markRenderDirty();
+      return;
+    }
+    const existing = matches[0];
     if (existing) {
       focusNode(existing, 1.15);
-      if (!state.expanded.has(existing.id)) {
+      if (state.canWrite && !state.expanded.has(existing.id)) {
         await expandEntity(existing.name);
-        focusNode(existing, 1.15);
+        focusNode(state.nodes.get(state.selected?.id) || existing, 1.15);
       }
       return;
     }
@@ -1926,41 +1582,49 @@ function getFrontier() {
 
 async function autoExpandFrontier() {
   if (state.autoExpanding) {
-    setStatus("Auto frontier expansion is already running.");
+    setStatus("Next-best expansion batch is already running.");
     return;
   }
   const budget = Math.max(1, Math.min(10, Number(els.autoBudget.value) || 1));
   els.autoBudget.value = String(budget);
-  const confirmed = window.confirm(`Auto expand frontier will make up to ${budget} model request${budget === 1 ? "" : "s"}. Continue?`);
+  await ensureNextAnalysis();
+  const frontier = getFrontier().slice(0, budget);
+  if (!frontier.length) {
+    setStatus("No unexpanded frontier nodes are available.");
+    return;
+  }
+  const preview = frontier.slice(0, 6).map(node => node.name).join(", ");
+  const more = frontier.length > 6 ? `, and ${frontier.length - 6} more` : "";
+  const confirmed = window.confirm(`Expand next best will queue ${frontier.length} expansions (each may use several budgeted model calls) one after another:\n\n${preview}${more}\n\nContinue?`);
   if (!confirmed) {
-    setStatus("Auto frontier expansion cancelled.");
+    setStatus("Next-best expansion batch cancelled.");
     return;
   }
   state.autoExpanding = true;
   els.autoExpand.disabled = true;
-  els.autoExpand.textContent = "Auto expanding...";
-  const queued = getFrontier().slice(0, budget).map(node => ({
+  els.autoExpand.textContent = "Expanding batch...";
+  const queued = frontier.map((node, index) => ({
     node,
-    activityId: addActivity("expand", `Expand ${node.name}`, "Queued by auto frontier", "queued")
+    activityId: addActivity("expand", `Expand ${node.name}`, `Queued #${index + 1} by next-best ranking`, "queued")
   }));
   try {
-    if (!queued.length) {
-      setStatus("Frontier is empty.");
-      return;
-    }
-    for (let i = 0; i < budget; i += 1) {
+    setStatus(`Queued ${queued.length} next-best expansion${queued.length === 1 ? "" : "s"}.`);
+    for (let i = 0; i < queued.length; i += 1) {
       const queuedItem = queued[i];
-      const next = queuedItem ? queuedItem.node : getFrontier()[0];
+      const next = queuedItem.node;
       if (!next) {
-        setStatus("Frontier is empty.");
+        setStatus("Next-best expansion batch ended early.");
         return;
       }
+      setStatus(`Expanding ${i + 1}/${queued.length}: ${next.name}`);
       await expandEntity(next.name, { activityId: queuedItem && queuedItem.activityId });
     }
+    setStatus(`Finished ${queued.length} next-best expansion${queued.length === 1 ? "" : "s"}.`);
   } finally {
     state.autoExpanding = false;
     els.autoExpand.disabled = false;
-    els.autoExpand.textContent = "Auto expand frontier";
+    els.autoExpand.textContent = "Expand next best";
+    renderNextPanel();
   }
 }
 
@@ -1969,16 +1633,21 @@ function simulatePhysics() {
   const edges = [...state.edges.values(), ...state.hiddenEdges.values()];
   state.physicsFrame += 1;
   for (const node of nodes) {
-    node.vx *= 0.78;
-    node.vy *= 0.78;
+    node.vx *= 0.72;
+    node.vy *= 0.72;
   }
 
-  function repel(a, b, strength = 1600) {
-    const dx = a.x - b.x;
-    const dy = a.y - b.y;
-    const distSq = Math.max(80, dx * dx + dy * dy);
-    const force = strength / distSq;
+  function pairForce(a, b, strength = 900, minDistance = 36) {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    if (Math.abs(dx) + Math.abs(dy) < 0.001) {
+      const angle = ((a.id.charCodeAt(0) || 1) * 12.9898 + (b.id.charCodeAt(0) || 1) * 78.233) % (Math.PI * 2);
+      dx = Math.cos(angle) * 0.01;
+      dy = Math.sin(angle) * 0.01;
+    }
+    const distSq = Math.max(minDistance * minDistance, dx * dx + dy * dy);
     const dist = Math.sqrt(distSq);
+    const force = strength / distSq;
     const fx = (dx / dist) * force;
     const fy = (dy / dist) * force;
     a.vx += fx;
@@ -1987,42 +1656,48 @@ function simulatePhysics() {
     b.vy -= fy;
   }
 
-  if (nodes.length <= 450) {
-    for (let i = 0; i < nodes.length; i += 1) {
-      for (let j = i + 1; j < nodes.length; j += 1) {
-        repel(nodes[i], nodes[j]);
-      }
+  function separateOverlap(a, b) {
+    let dx = b.x - a.x;
+    let dy = b.y - a.y;
+    let dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < 0.001) {
+      const angle = ((a.id.length + 1) * 19.19 + (b.id.length + 1) * 31.31) % (Math.PI * 2);
+      dx = Math.cos(angle);
+      dy = Math.sin(angle);
+      dist = 1;
+    }
+    const minDist = nodeRadius(a) + nodeRadius(b) + 14;
+    if (dist >= minDist) return;
+    const push = Math.min(8, (minDist - dist) * 0.18);
+    const fx = (dx / dist) * push;
+    const fy = (dy / dist) * push;
+    if (state.dragging !== a.id) {
+      a.x -= fx;
+      a.y -= fy;
+      a.vx -= fx * 0.08;
+      a.vy -= fy * 0.08;
+    }
+    if (state.dragging !== b.id) {
+      b.x += fx;
+      b.y += fy;
+      b.vx += fx * 0.08;
+      b.vy += fy * 0.08;
+    }
+  }
+
+  const n = nodes.length;
+  if (n <= 520) {
+    for (let i = 0; i < n; i += 1) {
+      for (let j = i + 1; j < n; j += 1) pairForce(nodes[i], nodes[j], 1050);
     }
   } else {
-    const cellSize = 260;
-    const grid = new Map();
-    const cellKey = (x, y) => `${x},${y}`;
-    for (const node of nodes) {
-      const cx = Math.floor(node.x / cellSize);
-      const cy = Math.floor(node.y / cellSize);
-      const key = cellKey(cx, cy);
-      const bucket = grid.get(key) || [];
-      bucket.push(node);
-      grid.set(key, bucket);
-    }
-    const neighborOffsets = [
-      [0, 0],
-      [1, 0],
-      [0, 1],
-      [1, 1],
-      [-1, 1]
-    ];
-    for (const [key, bucket] of grid) {
-      const [cx, cy] = key.split(",").map(Number);
-      for (const [dx, dy] of neighborOffsets) {
-        const otherBucket = grid.get(cellKey(cx + dx, cy + dy));
-        if (!otherBucket) continue;
-        for (let i = 0; i < bucket.length; i += 1) {
-          const start = otherBucket === bucket ? i + 1 : 0;
-          for (let j = start; j < otherBucket.length; j += 1) {
-            repel(bucket[i], otherBucket[j], 1300);
-          }
-        }
+    const stride = Math.max(31, Math.floor(Math.sqrt(n) * 7));
+    const samples = Math.min(10, n - 1);
+    const offset = state.physicsFrame % stride;
+    for (let i = 0; i < n; i += 1) {
+      for (let step = 1; step <= samples; step += 1) {
+        const j = (i + offset + step * stride) % n;
+        if (j > i) pairForce(nodes[i], nodes[j], 1200);
       }
     }
   }
@@ -2032,8 +1707,8 @@ function simulatePhysics() {
     const dy = edge.to.y - edge.from.y;
     const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
     const hidden = edge.confidence < state.minConfidence;
-    const target = 120 + (1 - edge.confidence) * 90;
-    const force = (dist - target) * (hidden ? 0.0012 : 0.003);
+    const target = nodeRadius(edge.from) + nodeRadius(edge.to) + 105 + (1 - edge.confidence) * 80;
+    const force = (dist - target) * (hidden ? 0.00045 : 0.00145);
     const fx = (dx / dist) * force;
     const fy = (dy / dist) * force;
     edge.from.vx += fx;
@@ -2042,14 +1717,46 @@ function simulatePhysics() {
     edge.to.vy -= fy;
   }
 
+  const collisionCellSize = 130;
+  const collisionKey = (x, y) => `${x},${y}`;
+  const collisionPasses = n > 1200 ? 1 : 2;
+  for (let pass = 0; pass < collisionPasses; pass += 1) {
+    const grid = new Map();
+    for (const node of nodes) {
+      const cx = Math.floor(node.x / collisionCellSize);
+      const cy = Math.floor(node.y / collisionCellSize);
+      const key = collisionKey(cx, cy);
+      const bucket = grid.get(key) || [];
+      bucket.push(node);
+      grid.set(key, bucket);
+    }
+    for (const [key, bucket] of grid) {
+      const [cx, cy] = key.split(",").map(Number);
+      for (let ox = -1; ox <= 1; ox += 1) {
+        for (let oy = -1; oy <= 1; oy += 1) {
+          const other = grid.get(collisionKey(cx + ox, cy + oy));
+          if (!other) continue;
+          const bucketLimit = n > 1200 ? Math.min(bucket.length, 18) : bucket.length;
+          const otherLimit = n > 1200 ? Math.min(other.length, 18) : other.length;
+          for (let i = 0; i < bucketLimit; i += 1) {
+            const start = other === bucket ? i + 1 : 0;
+            for (let j = start; j < otherLimit; j += 1) {
+              separateOverlap(bucket[i], other[j]);
+            }
+          }
+        }
+      }
+    }
+  }
+
   for (const node of nodes) {
     if (state.dragging === node.id) continue;
     const speed = Math.hypot(node.vx, node.vy);
-    if (speed > 5) {
-      const scale = 5 / speed;
+    if (speed > 3.2) {
+      const scale = 3.2 / speed;
       node.vx *= scale;
       node.vy *= scale;
-    } else if (speed < 0.015) {
+    } else if (speed < 0.01) {
       node.vx = 0;
       node.vy = 0;
     }
@@ -2058,7 +1765,7 @@ function simulatePhysics() {
   }
 }
 
-function drawArrow(from, to, confidence, count, selected, hidden = false, faded = false, direction = "") {
+function drawArrow(from, to, confidence, count, selected, hidden = false, faded = false, direction = "", simple = false) {
   const dx = to.x - from.x;
   const dy = to.y - from.y;
   const dist = Math.max(1, Math.sqrt(dx * dx + dy * dy));
@@ -2068,13 +1775,20 @@ function drawArrow(from, to, confidence, count, selected, hidden = false, faded 
   const startY = from.y + uy * (nodeRadius(from) + 3);
   const endX = to.x - ux * (nodeRadius(to) + 5);
   const endY = to.y - uy * (nodeRadius(to) + 5);
-  const width = 1 + confidence * 3 + Math.min(2, Math.log2(Math.max(1, count)) * 0.7);
+  const evidence = Math.log2(Math.max(1, count) + 1);
+  const width = 0.7 + confidence * 2.6 + Math.min(2.8, evidence * 0.55);
   const weak = confidence < 0.35;
   const dashed = hidden || (weak && !selected);
 
   const directional = direction === "incoming" || direction === "outgoing";
   const rootPath = direction === "root";
-  const alpha = hidden ? (faded ? 0.06 : 0.2) : faded ? 0.08 : weak ? 0.16 + confidence * 0.34 : 0.2 + confidence * 0.48;
+  const alpha = hidden
+    ? (faded ? 0.045 : 0.12 + confidence * 0.12)
+    : faded
+      ? 0.055
+      : weak
+        ? 0.12 + confidence * 0.32
+        : 0.22 + confidence * 0.55 + Math.min(0.12, evidence * 0.025);
   ctx.strokeStyle = rootPath
     ? `rgba(119, 77, 172, ${hidden ? 0.48 : 0.92})`
     : directional
@@ -2086,15 +1800,17 @@ function drawArrow(from, to, confidence, count, selected, hidden = false, faded 
       : selected
         ? "#b4472f"
         : `rgba(31, 35, 38, ${alpha})`;
-  ctx.lineWidth = rootPath ? Math.max(2.6, width + 1.2) : directional ? Math.max(2.2, width + 0.8) : hidden ? 1 : weak ? Math.max(1, width * 0.72) : width;
-  if (dashed) ctx.setLineDash([5, 7]);
+  ctx.lineWidth = rootPath ? Math.max(2.8, width + 1.2) : directional ? Math.max(2.2, width + 0.8) : hidden ? 0.9 : weak ? Math.max(0.8, width * 0.62) : width;
+  if (dashed && !simple) ctx.setLineDash([5, 7]);
   ctx.beginPath();
   ctx.moveTo(startX, startY);
   ctx.lineTo(endX, endY);
   ctx.stroke();
-  if (dashed) ctx.setLineDash([]);
+  if (dashed && !simple) ctx.setLineDash([]);
 
-  const size = 7 + confidence * 3;
+  if (simple) return;
+
+  const size = 6 + confidence * 3 + Math.min(2, evidence * 0.35);
   ctx.fillStyle = ctx.strokeStyle;
   ctx.beginPath();
   ctx.moveTo(endX, endY);
@@ -2104,8 +1820,27 @@ function drawArrow(from, to, confidence, count, selected, hidden = false, faded 
   ctx.fill();
 }
 
-function draw() {
-  simulatePhysics();
+function draw(timestamp = 0) {
+  const largeRender = state.nodes.size > 1200;
+  const interacting = performance.now() < state.interactingUntil;
+  if (state.interactionWasActive && !interacting) markRenderDirty();
+  state.interactionWasActive = interacting;
+  const animated = state.dragging || state.expanding.size || state.autoExpanding;
+  if (largeRender && !state.renderDirty && !animated) {
+    requestAnimationFrame(draw);
+    return;
+  }
+  const isInteracting = performance.now() < state.interactingUntil;
+  const frameGap = largeRender ? (isInteracting ? 16 : 90) : 0;
+  if (frameGap && timestamp && timestamp - state.lastRenderAt < frameGap) {
+    requestAnimationFrame(draw);
+    return;
+  }
+  state.lastRenderAt = timestamp || performance.now();
+  const largeGraph = state.nodes.size > 1200;
+  const shouldStepPhysics = !largeGraph || state.expanding.size;
+  if (shouldStepPhysics) simulatePhysics();
+  else state.physicsFrame += 1;
   const width = canvas.getBoundingClientRect().width;
   const height = canvas.getBoundingClientRect().height;
   ctx.clearRect(0, 0, width, height);
@@ -2115,25 +1850,36 @@ function draw() {
   const highlights = highlightedNodeIds();
   const rootId = focusNodeId();
   const hasFocus = highlights.size > 0;
+  const bounds = viewportBounds(isInteracting ? 80 : 180);
+  const simpleInteraction = largeRender && isInteracting;
 
   for (const edge of state.hiddenEdges.values()) {
+    if (!edgeInBounds(edge, bounds)) continue;
+    if (simpleInteraction && !hasFocus) continue;
+    if (simpleInteraction && edge.confidence < 0.35) continue;
     const related = !hasFocus || (highlights.has(edge.from.id) && highlights.has(edge.to.id));
-    drawArrow(edge.from, edge.to, edge.confidence, edge.count, false, true, !related, edgeDirectionFor(edge, rootId));
+    if (simpleInteraction && hasFocus && !related) continue;
+    drawArrow(edge.from, edge.to, edge.confidence, edge.count, false, true, !related, edgeDirectionFor(edge, rootId), simpleInteraction);
   }
 
   for (const [key, edge] of state.edges) {
+    if (!edgeInBounds(edge, bounds)) continue;
+    if (simpleInteraction && !hasFocus && edge.confidence < 0.32 && edge.count <= 1) continue;
     const selected = state.selected && state.selected.type === "edge" && state.selected.key === key;
     const related = !hasFocus || selected || (highlights.has(edge.from.id) && highlights.has(edge.to.id));
-    drawArrow(edge.from, edge.to, edge.confidence, edge.count, selected, false, !related, edgeDirectionFor(edge, rootId));
+    if (simpleInteraction && hasFocus && !related) continue;
+    drawArrow(edge.from, edge.to, edge.confidence, edge.count, selected, false, !related, edgeDirectionFor(edge, rootId), simpleInteraction);
   }
 
   for (const node of state.nodes.values()) {
+    if (!pointInBounds(node, bounds)) continue;
     const expanded = state.expanded.has(node.id);
     const expanding = state.expanding.has(node.id);
     const selected = state.selected && state.selected.type === "node" && state.selected.id === node.id;
     const hovered = state.hovered === node.id;
     const related = !hasFocus || highlights.has(node.id);
     const radius = nodeRadius(node);
+    const ambiguous = !simpleInteraction && !expanded && (node.aliases && node.aliases.length || (node.name.split(/\s+/).length <= 2 && node.popularity > 2));
     if (expanding) {
       const pulse = 5 + Math.sin(Date.now() / 180) * 3;
       ctx.strokeStyle = "rgba(180, 71, 47, 0.42)";
@@ -2144,15 +1890,31 @@ function draw() {
     }
     ctx.globalAlpha = related ? 1 : 0.24;
     ctx.fillStyle = expanded ? "#35a186" : "#f0b84d";
-    ctx.strokeStyle = expanding || selected || hovered ? "#b4472f" : "#1f2326";
-    ctx.lineWidth = expanding || selected || hovered ? 4 : 1.5;
+    ctx.strokeStyle = selected || hovered ? "#1f6fb8" : ambiguous ? "#b4472f" : expanded ? "#176e5f" : "#7a5a1b";
+    ctx.lineWidth = selected || hovered ? 3.8 : ambiguous ? 2.4 : expanded ? 1.8 : 1.4;
     ctx.beginPath();
     ctx.arc(node.x, node.y, selected ? radius + 3 : radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
+    if (expanded && !simpleInteraction) {
+      ctx.strokeStyle = "rgba(23, 110, 95, 0.42)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, radius + 4, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    if (ambiguous && !simpleInteraction) {
+      ctx.setLineDash([3, 4]);
+      ctx.strokeStyle = "rgba(180, 71, 47, 0.82)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(node.x, node.y, radius + 5.5, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
     ctx.globalAlpha = 1;
 
-    const showLabel = selected || hovered || expanding || state.zoom > 0.65 || node.weightedPopularity > state.maxWeightedPopularity * 0.16;
+    const showLabel = !isInteracting && (selected || hovered || expanding || state.zoom > 0.65 || nodeProminence(node) > maxNodeProminence() * 0.18);
     if (!showLabel) continue;
     ctx.fillStyle = related ? "#1f2326" : "rgba(31, 35, 38, 0.35)";
     ctx.font = "13px system-ui, sans-serif";
@@ -2163,6 +1925,7 @@ function draw() {
   }
 
   ctx.restore();
+  state.renderDirty = false;
   requestAnimationFrame(draw);
 }
 
@@ -2218,14 +1981,14 @@ function updateSelectedDetails() {
     const hiddenLine = hiddenIncoming || hiddenOutgoing
       ? `<br>Filtered low-confidence links: ${hiddenIncoming} incoming, ${hiddenOutgoing} outgoing`
       : "";
-    const aliases = node.aliases && node.aliases.length ? `<br>Aliases: ${node.aliases.slice(0, 4).join(", ")}` : "";
+    const aliases = node.aliases && node.aliases.length ? `<br>Aliases: ${node.aliases.slice(0, 4).map(escapeHtml).join(", ")}` : "";
     const isExpanding = state.expanding.has(node.id);
     const isExpanded = state.expanded.has(node.id);
     const stateLabel = isExpanding ? "Expanding now..." : isExpanded ? "Expanded" : "Not expanded yet";
     const actionLabel = isExpanding ? "Expanding..." : isExpanded ? "Sample again" : "Expand this entity";
     const actionHint = isExpanded && !isExpanding ? "<br><span>Runs another model pass and adds new observations without deleting existing ones.</span>" : "";
-    const action = `<br><button id="expand-selected" type="button" ${isExpanding ? "disabled" : ""}>${actionLabel}</button><button id="trace-roots-selected" type="button">Trace roots</button><button id="clear-selection" type="button">Clear selection</button>${actionHint}`;
-    els.selectedDetails.innerHTML = `<strong>${node.name}</strong><br>Visible incoming: ${incoming}<br>Visible outgoing: ${outgoing}${hiddenLine}<br>Popularity: ${Number(node.weightedPopularity || 0).toFixed(2)} weighted observations<br>Relative size: ${popularityPercent(node)}% of current max${aliases}<br>${stateLabel}${action}`;
+    const action = `<br><button id="expand-selected" type="button" ${isExpanding || !state.canWrite ? "disabled" : ""}>${actionLabel}</button><button id="trace-roots-selected" type="button">Trace roots</button><button id="clear-selection" type="button">Clear selection</button>${actionHint}`;
+    els.selectedDetails.innerHTML = `<strong>${escapeHtml(node.name)}</strong><br>Visible incoming: ${incoming}<br>Visible outgoing: ${outgoing}${hiddenLine}<br>Observed weight: ${Number(node.weightedPopularity || 0).toFixed(2)} weighted observations<br>Prominence: ${prominencePercent(node)}% of current max${aliases}<br>${stateLabel}${action}`;
     const button = document.querySelector("#expand-selected");
     if (button) {
       button.addEventListener("click", () => expandEntity(node.name).catch(error => setStatus(error.message)));
@@ -2247,11 +2010,11 @@ function updateSelectedDetails() {
   }
   const rows = (edge.observations || []).slice(-8).reverse().map(obs => {
     const when = obs.createdAt ? new Date(obs.createdAt).toLocaleString() : "unknown time";
-    const source = obs.sourceEntity ? ` from ${obs.sourceEntity}` : "";
-    const model = obs.model ? ` via ${obs.model}` : "";
-    return `<li>${Number(obs.confidence).toFixed(3)}${source}${model}<br><span>${when}</span></li>`;
+    const source = obs.sourceEntity ? ` sampled from ${escapeHtml(obs.sourceEntity)}` : "";
+    const model = obs.model ? ` via ${escapeHtml(obs.model)}` : "";
+    return `<li>${Number(obs.confidence).toFixed(3)}${source}${model}<br><span>${escapeHtml(when)} · ${escapeHtml(obs.evidenceType || "unknown")} · ${obs.sources?.length || 0} recorded source links</span></li>`;
   }).join("");
-  els.selectedDetails.innerHTML = `<strong>${edge.from.name} -> ${edge.to.name}</strong><br>Average confidence: ${edge.confidence.toFixed(3)}<br>Observations: ${edge.count}<button id="clear-selection" type="button">Clear selection</button><ul class="observation-list">${rows}</ul>`;
+  els.selectedDetails.innerHTML = `<strong>${escapeHtml(edge.from.name)} → ${escapeHtml(edge.to.name)}</strong><br>Mean sample score: ${edge.confidence.toFixed(3)}<br>Observations: ${edge.count}<button id="clear-selection" type="button">Clear selection</button><ul class="observation-list">${rows}</ul>`;
   const clearButton = document.querySelector("#clear-selection");
   if (clearButton) clearButton.addEventListener("click", clearSelection);
 }
@@ -2267,6 +2030,7 @@ function updateUi() {
   renderNextPanel();
   renderRootsPanel();
   if (state.view === "table") renderEntityTable();
+  markRenderDirty();
 }
 
 canvas.addEventListener("pointerdown", event => {
@@ -2277,17 +2041,20 @@ canvas.addEventListener("pointerdown", event => {
     state.selected = { type: "node", id: node.id };
     canvas.setPointerCapture(event.pointerId);
     updateUi();
+    markRenderDirty();
     return;
   }
   const edgeHit = hitEdge(point);
   if (edgeHit) {
     state.selected = { type: "edge", key: edgeHit.key };
     updateUi();
+    markRenderDirty();
     return;
   }
   if (state.selected) {
     state.selected = null;
     updateUi();
+    markRenderDirty();
   }
   state.lastPointer = { x: event.clientX, y: event.clientY };
 });
@@ -2300,25 +2067,34 @@ canvas.addEventListener("pointermove", event => {
     node.y = point.y;
     node.vx = 0;
     node.vy = 0;
+    markInteracting();
     return;
   }
-  const hoverNode = hitNode(graphPoint(event));
-  state.hovered = hoverNode ? hoverNode.id : null;
   if (state.lastPointer) {
     state.pan.x += event.clientX - state.lastPointer.x;
     state.pan.y += event.clientY - state.lastPointer.y;
     state.lastPointer = { x: event.clientX, y: event.clientY };
+    markInteracting();
+    return;
+  }
+  const hoverNode = hitNode(graphPoint(event));
+  const nextHovered = hoverNode ? hoverNode.id : null;
+  if (state.hovered !== nextHovered) {
+    state.hovered = nextHovered;
+    markRenderDirty();
   }
 });
 
 canvas.addEventListener("pointerleave", () => {
   state.hovered = null;
+  markRenderDirty();
 });
 
 canvas.addEventListener("pointerup", () => {
   if (state.dragging || state.lastPointer) scheduleSave();
   state.dragging = null;
   state.lastPointer = null;
+  markRenderDirty();
 });
 
 canvas.addEventListener("wheel", event => {
@@ -2337,6 +2113,7 @@ canvas.addEventListener("wheel", event => {
     y: mouseY - before.y * state.zoom
   };
   scheduleSave();
+  markInteracting(260);
 }, { passive: false });
 
 canvas.addEventListener("dblclick", event => {
@@ -2380,6 +2157,11 @@ els.panelTabs.forEach(button => {
       renderRootsPanel();
     } else if (tab === "next") {
       renderNextPanel();
+    } else if (tab === "dedupe" && state.devTools) {
+      loadDedupeSuggestions().catch(error => {
+        if (els.dedupeOutput) els.dedupeOutput.textContent = error.message;
+        setStatus(error.message);
+      });
     }
   });
 });
@@ -2484,7 +2266,7 @@ els.autoExpand.addEventListener("click", () => {
 
 els.autoExpand.addEventListener("contextmenu", event => {
   event.preventDefault();
-  setStatus("Auto frontier expansion needs a normal click and confirmation.");
+  setStatus("Expand next best needs a normal click and confirmation.");
 });
 
 els.dedupeReview.addEventListener("click", async () => {
@@ -2503,6 +2285,7 @@ els.dedupeReview.addEventListener("click", async () => {
     const payload = await response.json();
     if (!response.ok) throw new Error(payload.error || "Identity sweep failed");
     if (payload.debugPrompt) updateActivity(activityId, { prompt: payload.debugPrompt });
+    await refreshGraph();
     const suggestions = payload.pending || [];
     if (!suggestions.length) {
       els.dedupeOutput.textContent = `No confident identity groups found from ${payload.candidates.length} local candidates.`;
@@ -2550,31 +2333,23 @@ els.dedupeOutput.addEventListener("click", event => {
   const id = button.getAttribute("data-id");
   const action = button.getAttribute("data-dedupe-action");
   button.disabled = true;
-  button.textContent = action === "approve" ? "Merging..." : "Rejecting...";
+  button.textContent = action === "approve" ? "Applying..." : "Rejecting...";
   decideDedupeSuggestion(id, action).catch(error => {
     setStatus(error.message);
     loadDedupeSuggestions().catch(() => {});
   });
 });
 
-els.reset.addEventListener("click", () => {
-  const confirmed = window.confirm("Reset clears the persistent graph in this browser and saves the empty graph. Continue?");
-  if (!confirmed) {
-    setStatus("Reset cancelled.");
-    return;
-  }
-  state.nodes.clear();
-  state.observations = [];
-  state.edges.clear();
-  state.hiddenEdges.clear();
-  state.expanded.clear();
-  state.selected = null;
-  state.pan = { x: 0, y: 0 };
-  state.zoom = 1;
-  invalidateGraphAnalysis();
-  setStatus("Reset.");
-  scheduleSave();
-  updateUi();
+els.reset.addEventListener("click", async () => {
+  if (!window.confirm("Reset clears the shared graph. An undo snapshot is retained in Identity history. Continue?")) return;
+  try {
+    const response = await fetch("/api/reset", { method: "POST", headers: { "content-type": "application/json", ...adminHeaders() }, body: JSON.stringify({ revision: state.revision }) });
+    const payload = await response.json();
+    if (!response.ok) { if (response.status === 409) await refreshGraph(); throw new Error(payload.error); }
+    await acceptServerPayload(payload);
+    updateUi();
+    setStatus("Graph reset. Undo is available in Identity history until the next graph change.");
+  } catch (error) { setStatus(error.message); }
 });
 
 els.minConfidence.addEventListener("input", () => {
@@ -2583,11 +2358,41 @@ els.minConfidence.addEventListener("input", () => {
   updateUi();
 });
 
-window.addEventListener("resize", resizeCanvas);
+window.addEventListener("resize", () => {
+  resizeCanvas();
+  markRenderDirty();
+});
 window.addEventListener("keydown", event => {
   if (event.key === "Escape" && state.selected) {
     clearSelection();
   }
+});
+
+async function loadHistory() {
+  const output = document.querySelector("#history-output");
+  const response = await fetch("/api/history", { headers: adminHeaders() });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "History could not be loaded");
+  output.innerHTML = payload.history.map(event => `<div class="dedupe-group"><strong>${escapeHtml(event.action)}</strong><p>${escapeHtml(new Date(event.createdAt).toLocaleString())}</p><p>${escapeHtml(event.details.canonical || event.details.reason || "Graph mutation")}</p>${!event.undoneBy && event.afterRevision === payload.revision ? `<button type="button" data-undo-id="${Number(event.id)}">Undo this edit</button>` : "<span>Newer changes prevent a safe undo here.</span>"}</div>`).join("") || "No graph edits recorded yet.";
+}
+
+document.querySelector("#load-history").addEventListener("click", () => loadHistory().catch(error => setStatus(error.message)));
+document.querySelector("#history-output").addEventListener("click", async event => {
+  const button = event.target.closest("[data-undo-id]");
+  if (!button || !window.confirm("Undo this latest graph edit? Its previous state will be restored and the undo recorded.")) return;
+  try {
+    const response = await fetch("/api/history/" + Number(button.dataset.undoId) + "/undo", { method: "POST", headers: { "content-type": "application/json", ...adminHeaders() }, body: JSON.stringify({ revision: state.revision }) });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error);
+    await acceptServerPayload(payload); updateUi(); await loadHistory(); await loadDedupeSuggestions();
+    setStatus(payload.result.reason);
+  } catch (error) { setStatus(error.message); await refreshGraph(); }
+});
+
+
+els.selectedDetails.addEventListener("click", event => {
+  const choice = event.target.closest("[data-search-choice]");
+  if (choice) focusNode(state.nodes.get(choice.getAttribute("data-search-choice")), 1.15);
 });
 
 resizeCanvas();

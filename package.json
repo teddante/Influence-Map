@@ -1,6 +1,11 @@
 {
+  "name": "influence-map",
+  "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
   },
-  "dependencies": {}
+  "engines": {
+    "node": ">=24.0.0 <25"
+  }
 }
